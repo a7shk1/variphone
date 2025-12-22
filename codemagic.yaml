@@ -1,6 +1,6 @@
 workflows:
   ios-release:
-    name: iOS Unsigned IPA - variphone
+    name: iOS Unsigned IPA - variphone (fixed)
     max_build_duration: 60
     instance_type: mac_mini_m2
 
@@ -15,18 +15,73 @@ workflows:
           flutter clean
           flutter pub get
 
-      - name: (Optional) CocoaPods install
+      - name: Force iOS deployment target (Podfile = 13.0)
         script: |
           set -euo pipefail
-          if [ -d "ios" ] && [ -f "ios/Podfile" ]; then
-            cd ios
-            pod install
-            cd ..
+
+          if [ ! -f "ios/Podfile" ]; then
+            echo "ios/Podfile not found!"
+            exit 1
           fi
+
+          # 1) Ensure platform :ios, '13.0' exists (or update it if present)
+          ruby -e "
+            path='ios/Podfile'
+            s=File.read(path)
+
+            if s =~ /^platform :ios,/
+              s = s.sub(/^platform :ios, *'[^']*'/, \"platform :ios, '13.0'\")
+            else
+              s = \"platform :ios, '13.0'\\n\" + s
+            end
+
+            File.write(path, s)
+          "
+
+          # 2) Ensure post_install forces deployment target for Pods
+          #    (prevents pods staying at 12.0 while Runner is 13.0)
+          ruby -e "
+            path='ios/Podfile'
+            s=File.read(path)
+
+            post_install_block = <<~RUBY
+
+            post_install do |installer|
+              installer.pods_project.targets.each do |target|
+                target.build_configurations.each do |config|
+                  config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '13.0'
+                end
+              end
+            end
+            RUBY
+
+            unless s.include?('post_install do |installer|')
+              s = s + post_install_block
+              File.write(path, s)
+            end
+          "
+
+          echo "=== Podfile platform line ==="
+          grep -n \"^platform :ios\" ios/Podfile || true
+          echo "=== Podfile post_install exists? ==="
+          grep -n \"post_install do \\|installer\\|\" ios/Podfile || true
+
+      - name: CocoaPods install
+        script: |
+          set -euo pipefail
+          cd ios
+
+          # Fresh pods setup on CI
+          pod repo update
+          pod install --repo-update
+
+          cd ..
 
       - name: Build unsigned IPA (no codesign)
         script: |
           set -euo pipefail
+
+          flutter --version
           flutter build ipa --release --no-codesign
 
           echo "=== LIST build/ios ==="
@@ -39,7 +94,7 @@ workflows:
           ls -la build/ios/archive || true
 
           echo "=== FIND IPA ==="
-          find build/ios -maxdepth 4 -type f -name "*.ipa" -print || true
+          find build/ios -maxdepth 5 -type f -name "*.ipa" -print || true
 
     artifacts:
       - build/ios/ipa/*.ipa
