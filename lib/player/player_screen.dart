@@ -19,7 +19,8 @@ class PlayerScreen extends StatefulWidget {
 class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver {
   VideoPlayerController? _ctrl;
 
-  String _status = 'Loading...';
+  // UI state
+  String _status = 'Opening Player...';
   bool _showUi = true;
   bool _fitCover = true;
   bool _isRestarting = false;
@@ -36,19 +37,48 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
   String? _url;
   Map<String, String> _headers = const {};
 
+  // on-screen logs (حتى ما تحتاج 3uTools كل مرة)
+  final List<String> _logs = [];
+  void _log(String s) {
+    dev.log(s, name: 'VarPlayer');
+    if (!mounted) return;
+    setState(() {
+      _logs.add(s);
+      if (_logs.length > 25) _logs.removeAt(0);
+    });
+  }
+
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
 
-    SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
-    SystemChrome.setPreferredOrientations(const [
-      DeviceOrientation.landscapeLeft,
-      DeviceOrientation.landscapeRight,
-    ]);
-    WakelockPlus.enable();
+    // مهم: أي شغل Plugins نخليه بعد أول فريم وبـ await + try/catch
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      await _safeSetupUi();
+      await _openFromRaw(widget.rawLink);
+    });
+  }
 
-    WidgetsBinding.instance.addPostFrameCallback((_) => _openFromRaw(widget.rawLink));
+  Future<void> _safeSetupUi() async {
+    try {
+      await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+      await SystemChrome.setPreferredOrientations(const [
+        DeviceOrientation.landscapeLeft,
+        DeviceOrientation.landscapeRight,
+      ]);
+      _log('UI mode + landscape OK');
+    } catch (e) {
+      _log('UI setup error: $e');
+    }
+
+    try {
+      await WakelockPlus.enable();
+      _log('Wakelock enabled OK');
+    } catch (e) {
+      // لو هنا يطلع MissingPluginException راح تشوفه على الشاشة
+      _log('Wakelock error: $e');
+    }
   }
 
   @override
@@ -58,9 +88,14 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
     _ctrl?.dispose();
 
     WidgetsBinding.instance.removeObserver(this);
-    WakelockPlus.disable();
-    SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
-    SystemChrome.setPreferredOrientations(DeviceOrientation.values);
+
+    // نخليها safe هم
+    () async {
+      try { await WakelockPlus.disable(); } catch (_) {}
+      try { await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge); } catch (_) {}
+      try { await SystemChrome.setPreferredOrientations(DeviceOrientation.values); } catch (_) {}
+    }();
+
     super.dispose();
   }
 
@@ -68,25 +103,30 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
   void didChangeAppLifecycleState(AppLifecycleState s) {
     if (s == AppLifecycleState.paused) {
       _ctrl?.pause();
-      WakelockPlus.disable();
+      () async { try { await WakelockPlus.disable(); } catch (_) {} }();
     } else if (s == AppLifecycleState.resumed) {
-      WakelockPlus.enable();
+      () async { try { await WakelockPlus.enable(); } catch (_) {} }();
     }
   }
 
   // ---------- Core open ----------
   Future<void> _openFromRaw(String raw) async {
+    _log('Incoming rawLink length=${raw.length}');
     final parsed = StreamResolver.parseIncoming(raw);
     final url = parsed.url;
     if (url == null) {
       setState(() => _status = 'Bad link');
+      _log('Bad link (parseIncoming returned null)');
       return;
     }
+
     _url = url;
     _headers = parsed.headers;
     _retryCount = 0;
     _retryDelay = const Duration(seconds: 3);
 
+    _log('Parsed URL: $url');
+    _log('Headers count: ${_headers.length}');
     await _openResolved(url, _headers);
   }
 
@@ -97,24 +137,31 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
       _status = 'Resolving...';
       _isRestarting = true;
     });
+    _log('Resolving...');
 
     try {
       final res = await StreamResolver.resolve(url, headers: headers);
       if (!mounted || myEpoch != _epoch) return;
 
-      dev.log('Resolved -> ${res.url}', name: 'VarPlayer');
+      _log('Resolved URL: ${res.url}');
       _url = res.url;
       _headers = res.headers;
 
       await _openController(res.url, res.headers, myEpoch);
     } catch (e) {
-      dev.log('resolve failed: $e', name: 'VarPlayer');
+      _log('resolve failed: $e');
       _scheduleRetry(url, myEpoch, headers, forceResolve: true);
     }
   }
 
   Future<void> _openController(String url, Map<String, String> headers, int myEpoch) async {
     final old = _ctrl;
+
+    setState(() {
+      _status = 'Initializing player...';
+      _isRestarting = true;
+    });
+    _log('Creating VideoPlayerController...');
 
     final ctrl = VideoPlayerController.networkUrl(
       Uri.parse(url),
@@ -133,22 +180,23 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
       ctrl.addListener(() {
         final v = ctrl.value;
         if (v.hasError && mounted && myEpoch == _epoch) {
+          _log('Player error: ${v.errorDescription}');
           _scheduleRetry(url, myEpoch, headers);
         }
       });
 
       await ctrl.play();
-      try {
-        await old?.dispose();
-      } catch (_) {}
+      try { await old?.dispose(); } catch (_) {}
 
       setState(() {
         _status = 'Playing';
         _isRestarting = false;
         _retryCount = 0;
       });
+      _log('Playing OK ✅');
       _kickAutoHide();
-    } catch (_) {
+    } catch (e) {
+      _log('initialize/play failed: $e');
       if (mounted && myEpoch == _epoch) _scheduleRetry(url, myEpoch, headers);
     }
   }
@@ -172,6 +220,8 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
     _retryCount = (_retryCount >= _retryMax) ? 0 : (_retryCount + 1);
     final next = (_retryDelay * 2) > _retryDelayMax ? _retryDelayMax : (_retryDelay * 2);
     _retryDelay = _withJitter(next);
+
+    _log('Retry #$_retryCount in ${_retryDelay.inSeconds}s');
 
     _retryTimer?.cancel();
     _retryTimer = Timer(_retryDelay, () async {
@@ -233,7 +283,6 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
       if (!initialized || _ctrl == null) {
         return Text(_status, style: const TextStyle(color: Colors.white70));
       }
-
       return FittedBox(
         fit: _fitCover ? BoxFit.cover : BoxFit.contain,
         child: SizedBox(
@@ -267,8 +316,12 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
         body: Stack(
           children: [
             Positioned.fill(child: Center(child: videoArea())),
+
+            // loading spinner
             if (initialized && (buffering || _isRestarting))
               const Positioned.fill(child: IgnorePointer(child: Center(child: CircularProgressIndicator()))),
+
+            // Controls overlay
             if (initialized && _showUi)
               Positioned.fill(
                 child: Container(
@@ -283,8 +336,7 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
                             const SizedBox(width: 8),
                             Container(
                               padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                              decoration:
-                              BoxDecoration(color: Colors.black54, borderRadius: BorderRadius.circular(14)),
+                              decoration: BoxDecoration(color: Colors.black54, borderRadius: BorderRadius.circular(14)),
                               child: Text(_isVod ? 'VOD' : 'LIVE',
                                   style: const TextStyle(color: Colors.white, fontSize: 12)),
                             ),
@@ -314,6 +366,7 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
                           ],
                         ),
                       ),
+
                       Row(
                         mainAxisAlignment: MainAxisAlignment.center,
                         children: [
@@ -334,6 +387,7 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
                           ),
                         ],
                       ),
+
                       SafeArea(
                         child: Padding(
                           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
@@ -383,6 +437,32 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
                   ),
                 ),
               ),
+
+            // ✅ debug log panel (تقدر تخليه بس مؤقتاً)
+            Positioned(
+              left: 8,
+              right: 8,
+              bottom: 8,
+              child: IgnorePointer(
+                child: Opacity(
+                  opacity: 0.75,
+                  child: Container(
+                    padding: const EdgeInsets.all(8),
+                    decoration: BoxDecoration(
+                      color: Colors.black87,
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(color: Colors.white24),
+                    ),
+                    child: Text(
+                      _logs.join('\n'),
+                      style: const TextStyle(color: Colors.white70, fontSize: 11),
+                      maxLines: 10,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ),
+              ),
+            ),
           ],
         ),
       ),
@@ -400,6 +480,7 @@ class _BufferedBar extends StatelessWidget {
   final Duration duration, position;
   final List<DurationRange> ranges;
   final ValueChanged<Duration> onSeek;
+
   const _BufferedBar({
     required this.duration,
     required this.position,
