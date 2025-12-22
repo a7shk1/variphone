@@ -1,5 +1,5 @@
 name: var_app
-description: "Var iPhone (App + Player)"
+description: "Var_IPTV"
 publish_to: 'none'
 version: 1.0.0+1
 
@@ -9,36 +9,19 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-
   cupertino_icons: ^1.0.8
 
-  # Networking + parsing
+  # Streaming
   http: ^1.2.0
-  intl: ^0.19.0
-
-  # Device / local
-  device_info_plus: ^10.1.2
-  shared_preferences: ^2.3.3
-
-  # Utils
-  uuid: ^4.0.0
-  crypto: ^3.0.2
-
-  # Images
-  cached_network_image: ^3.3.1
-
-  # Open external links (optional)
-  url_launcher: ^6.3.0
-
-  # App version
-  package_info_plus: ^8.0.0
-
-  # Permissions (optional)
-  permission_handler: ^11.3.1
-
-  # ===== Player (in-app) =====
   video_player: ^2.9.1
   wakelock_plus: ^1.2.8
+  device_info_plus: ^10.1.2
+
+  # UI / Utils
+  cached_network_image: ^3.3.1
+  url_launcher: ^6.3.0
+  intl: ^0.19.0
+  shared_preferences: ^2.3.3
 
 dev_dependencies:
   flutter_test:

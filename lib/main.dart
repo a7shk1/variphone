@@ -1,32 +1,95 @@
+// lib/main.dart
+import 'dart:async';
 import 'package:flutter/material.dart';
-import 'player/player_screen.dart';
 
-void main() => runApp(const MyApp());
+import 'theme/app_theme.dart';
+import 'widgets/animated_gradient_background.dart';
 
-class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+import 'screens/splash_screen.dart';
+import 'screens/home_screen.dart';
+import 'screens/subscription_screen.dart';
+import 'screens/privacy_policy_screen.dart';
+import 'screens/contact_screen.dart';
+import 'screens/developer_info_screen.dart';
+
+final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
+
+/// ✅ DEMO MODE:
+/// - true  => يدخل Home مباشرة (بدون اشتراك/فايربيس)
+/// - false => يفتح SubscriptionScreen
+const bool kBypassSubscriptions = true;
+
+/// مدة بقاء السبلاتش (حتى يبين بشكل حلو)
+const Duration kSplashMinDuration = Duration(milliseconds: 1200);
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  runZonedGuarded(() {
+    FlutterError.onError = (details) {
+      FlutterError.dumpErrorToConsole(details);
+    };
+
+    runApp(const VarApp());
+
+    // ✅ لا نسوي أي await قبل runApp حتى ما يعلق iOS
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _bootstrapAfterFirstFrame();
+    });
+  }, (error, stack) {
+    debugPrint('ZONED ERROR: $error');
+    debugPrint('$stack');
+  });
+}
+
+Future<void> _bootstrapAfterFirstFrame() async {
+  // ✅ نخلي السبلاتش يثبت شوي
+  await Future.delayed(kSplashMinDuration);
+
+  final nav = navigatorKey.currentState;
+  if (nav == null) return;
+
+  // ✅ بدون Firebase: قرر وين تروح
+  if (kBypassSubscriptions) {
+    nav.pushReplacement(
+      MaterialPageRoute(builder: (_) => const HomeScreen()),
+    );
+  } else {
+    nav.pushReplacement(
+      MaterialPageRoute(builder: (_) => const SubscriptionScreen()),
+    );
+  }
+}
+
+class VarApp extends StatelessWidget {
+  const VarApp({super.key});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
+      title: 'Var IPTV',
       debugShowCheckedModeBanner: false,
-      home: Scaffold(
-        body: Center(
-          child: ElevatedButton(
-            onPressed: () {
-              Navigator.push(
-                context,
-                MaterialPageRoute(
-                  builder: (_) => const PlayerScreen(
-                    rawLink: 'https://devstreaming-cdn.apple.com/videos/streaming/examples/bipbop_16x9/bipbop_16x9_variant.m3u8',
-                  ),
-                ),
-              );
-            },
-            child: const Text('Open Player'),
-          ),
-        ),
-      ),
+      theme: AppTheme.darkTheme,
+      navigatorKey: navigatorKey,
+
+      // ✅ خلفية متحركة/تدرج مثل مشروعك
+      builder: (context, child) {
+        return Stack(
+          children: [
+            const Positioned.fill(child: GlobalBackground()),
+            if (child != null) child,
+          ],
+        );
+      },
+
+      routes: {
+        '/privacy': (_) => const PrivacyPolicyScreen(),
+        '/contact': (_) => const ContactScreen(),
+        '/developer': (_) => const DeveloperInfoScreen(),
+      },
+
+      // ✅ نبدأ بالسبلاتش دائماً
+      home: const SplashScreen(),
     );
   }
 }
