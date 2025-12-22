@@ -1,6 +1,6 @@
 workflows:
   ios-release:
-    name: iOS Unsigned IPA (Payload) - variphone
+    name: iOS Unsigned IPA - variphone
     max_build_duration: 60
     instance_type: mac_mini_m2
 
@@ -11,40 +11,40 @@ workflows:
     scripts:
       - name: Clean & get packages
         script: |
+          set -euo pipefail
           flutter clean
           flutter pub get
 
-      - name: Build iOS app (no codesign)
+      - name: (Optional) CocoaPods install
         script: |
-          flutter build ios --release --no-codesign
+          set -euo pipefail
+          if [ -d "ios" ] && [ -f "ios/Podfile" ]; then
+            cd ios
+            pod install
+            cd ..
+          fi
+
+      - name: Build unsigned IPA (no codesign)
+        script: |
+          set -euo pipefail
+          flutter build ipa --release --no-codesign
+
           echo "=== LIST build/ios ==="
           ls -la build/ios || true
-          echo "=== LIST build/ios/iphoneos ==="
-          ls -la build/ios/iphoneos || true
-          echo "=== FIND .app ==="
-          find build/ios -maxdepth 4 -type d -name "*.app" -print || true
 
-      - name: Package unsigned IPA from Runner.app
-        script: |
-          set -e
-          APP="build/ios/iphoneos/Runner.app"
+          echo "=== LIST build/ios/ipa ==="
+          ls -la build/ios/ipa || true
 
-          echo "Checking Runner.app exists..."
-          ls -la "$APP"
+          echo "=== LIST build/ios/archive ==="
+          ls -la build/ios/archive || true
 
-          echo "Checking flutter assets..."
-          ls -la "$APP/Frameworks/App.framework/flutter_assets" | head -n 10 || true
-
-          rm -rf build/ios/unsigned
-          mkdir -p build/ios/unsigned/Payload
-          cp -R "$APP" build/ios/unsigned/Payload/
-
-          cd build/ios/unsigned
-          /usr/bin/zip -qry variphone_unsigned.ipa Payload
+          echo "=== FIND IPA ==="
+          find build/ios -maxdepth 4 -type f -name "*.ipa" -print || true
 
     artifacts:
-      - build/ios/unsigned/*.ipa
-      - build/ios/iphoneos/*.app
+      - build/ios/ipa/*.ipa
+      - build/ios/archive/*.xcarchive
+      - build/ios/ipa/*.dSYM.zip
 
     publishing:
       email:
