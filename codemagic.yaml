@@ -9,114 +9,42 @@ workflows:
       xcode: latest
 
     scripts:
-      - name: Flutter clean & pub get
+      - name: Clean & get packages
         script: |
-          set -euo pipefail
-          flutter --version
           flutter clean
           flutter pub get
 
-      - name: CocoaPods + Fix iOS deployment target (ensure Runner.app builds)
+      - name: Build iOS app (no codesign)
         script: |
-          set -euo pipefail
-
-          echo "=== Ruby & CocoaPods ==="
-          ruby -v
-          gem --version || true
-
-          # Install cocoapods if missing
-          if ! command -v pod >/dev/null 2>&1; then
-            echo "CocoaPods not found -> installing..."
-            sudo gem install cocoapods -N
-          fi
-          pod --version
-
-          echo "=== Ensure Podfile has platform :ios, '13.0' ==="
-          PODFILE="ios/Podfile"
-          if [ -f "$PODFILE" ]; then
-            # If no platform line, insert at top
-            if ! grep -qE "^\s*platform\s*:ios" "$PODFILE"; then
-              echo "No platform line found. Adding platform :ios, '13.0' to top."
-              tmpfile="$(mktemp)"
-              echo "platform :ios, '13.0'" > "$tmpfile"
-              echo "" >> "$tmpfile"
-              cat "$PODFILE" >> "$tmpfile"
-              mv "$tmpfile" "$PODFILE"
-            else
-              # If platform is lower than 13, bump to 13
-              # (simple replace: any platform :ios, '12.x' -> '13.0')
-              sed -i '' -E "s/^\s*platform\s*:ios,\s*'([0-9]+)\.([0-9]+)'\s*$/platform :ios, '13.0'/g" "$PODFILE" || true
-              sed -i '' -E "s/^\s*platform\s*:ios,\s*\"([0-9]+)\.([0-9]+)\"\s*$/platform :ios, '13.0'/g" "$PODFILE" || true
-            fi
-
-            echo "=== Podfile (platform lines) ==="
-            grep -n "platform :ios" "$PODFILE" || true
-          else
-            echo "Podfile not found at ios/Podfile"
-            exit 1
-          fi
-
-          echo "=== Pod install (fresh) ==="
-          cd ios
-          rm -rf Pods Podfile.lock
-          pod repo update --silent || true
-          pod install --repo-update
-          cd ..
-
-      - name: Build iOS app (no codesign) + verify Runner.app
-        script: |
-          set -euo pipefail
-
-          echo "=== Build iOS (release, no codesign) ==="
-          flutter build ios --release --no-codesign -v
-
+          flutter build ios --release --no-codesign
           echo "=== LIST build/ios ==="
           ls -la build/ios || true
           echo "=== LIST build/ios/iphoneos ==="
           ls -la build/ios/iphoneos || true
+          echo "=== FIND .app ==="
+          find build/ios -maxdepth 4 -type d -name "*.app" -print || true
 
-          echo "=== FIND Runner.app ==="
-          find build/ios -maxdepth 6 -type d -name "Runner.app" -print || true
-
-          APP_PATH="$(find build/ios -maxdepth 6 -type d -name 'Runner.app' | head -n 1)"
-          if [ -z "$APP_PATH" ]; then
-            echo "❌ Runner.app not found. Build likely failed. Printing build/ios tree (top levels):"
-            find build/ios -maxdepth 4 -print || true
-            exit 1
-          fi
-
-          echo "✅ Runner.app found at: $APP_PATH"
-          echo "$APP_PATH" > build/ios/RUNNER_APP_PATH.txt
-
-      - name: Package unsigned IPA from Runner.app (auto path)
+      - name: Package unsigned IPA from Runner.app
         script: |
-          set -euo pipefail
-
-          APP_PATH="$(cat build/ios/RUNNER_APP_PATH.txt)"
-          echo "Using APP_PATH = $APP_PATH"
+          set -e
+          APP="build/ios/iphoneos/Runner.app"
 
           echo "Checking Runner.app exists..."
-          ls -la "$APP_PATH"
+          ls -la "$APP"
 
-          echo "Checking flutter assets (optional)..."
-          ls -la "$APP_PATH/Frameworks/App.framework/flutter_assets" 2>/dev/null | head -n 10 || true
+          echo "Checking flutter assets..."
+          ls -la "$APP/Frameworks/App.framework/flutter_assets" | head -n 10 || true
 
           rm -rf build/ios/unsigned
           mkdir -p build/ios/unsigned/Payload
-
-          # Copy .app into Payload
-          cp -R "$APP_PATH" build/ios/unsigned/Payload/
+          cp -R "$APP" build/ios/unsigned/Payload/
 
           cd build/ios/unsigned
           /usr/bin/zip -qry variphone_unsigned.ipa Payload
 
-          echo "✅ IPA created:"
-          ls -la *.ipa
-
     artifacts:
       - build/ios/unsigned/*.ipa
-      - build/ios/RUNNER_APP_PATH.txt
-      - build/ios/**/Runner.app
+      - build/ios/iphoneos/*.app
 
     publishing:
       email:
