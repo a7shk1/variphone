@@ -1,6 +1,6 @@
 workflows:
   ios-release:
-    name: iOS Unsigned IPA (Payload) - variphone
+    name: iOS IPA (Flutter build ipa) - variphone
     max_build_duration: 60
     instance_type: mac_mini_m2
 
@@ -11,40 +11,32 @@ workflows:
     scripts:
       - name: Clean & get packages
         script: |
+          set -e
           flutter clean
           flutter pub get
 
-      - name: Build iOS app (no codesign)
-        script: |
-          flutter build ios --release --no-codesign
-          echo "=== LIST build/ios ==="
-          ls -la build/ios || true
-          echo "=== LIST build/ios/iphoneos ==="
-          ls -la build/ios/iphoneos || true
-          echo "=== FIND .app ==="
-          find build/ios -maxdepth 4 -type d -name "*.app" -print || true
-
-      - name: Package unsigned IPA from Runner.app
+      - name: Install CocoaPods (safe)
         script: |
           set -e
-          APP="build/ios/iphoneos/Runner.app"
+          cd ios
+          pod repo update
+          pod install
+          cd ..
 
-          echo "Checking Runner.app exists..."
-          ls -la "$APP"
+      - name: Build iOS IPA (release)
+        script: |
+          set -e
+          flutter --version
+          flutter build ipa --release
 
-          echo "Checking flutter assets..."
-          ls -la "$APP/Frameworks/App.framework/flutter_assets" | head -n 10 || true
+          echo "=== LIST build/ios/ipa ==="
+          ls -la build/ios/ipa || true
 
-          rm -rf build/ios/unsigned
-          mkdir -p build/ios/unsigned/Payload
-          cp -R "$APP" build/ios/unsigned/Payload/
-
-          cd build/ios/unsigned
-          /usr/bin/zip -qry variphone_unsigned.ipa Payload
+          echo "=== FIND IPA ==="
+          find build/ios -maxdepth 4 -type f -name "*.ipa" -print || true
 
     artifacts:
-      - build/ios/unsigned/*.ipa
-      - build/ios/iphoneos/*.app
+      - build/ios/ipa/*.ipa
 
     publishing:
       email:
