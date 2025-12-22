@@ -1,0 +1,52 @@
+workflows:
+  ios-release:
+    name: iOS Unsigned IPA (Payload) - variphone
+    max_build_duration: 60
+    instance_type: mac_mini_m2
+
+    environment:
+      flutter: stable
+      xcode: latest
+
+    scripts:
+      - name: Clean & get packages
+        script: |
+          flutter clean
+          flutter pub get
+
+      - name: Build iOS app (no codesign)
+        script: |
+          flutter build ios --release --no-codesign
+          echo "=== LIST build/ios ==="
+          ls -la build/ios || true
+          echo "=== LIST build/ios/iphoneos ==="
+          ls -la build/ios/iphoneos || true
+          echo "=== FIND .app ==="
+          find build/ios -maxdepth 4 -type d -name "*.app" -print || true
+
+      - name: Package unsigned IPA from Runner.app
+        script: |
+          set -e
+          APP="build/ios/iphoneos/Runner.app"
+
+          echo "Checking Runner.app exists..."
+          ls -la "$APP"
+
+          echo "Checking flutter assets..."
+          ls -la "$APP/Frameworks/App.framework/flutter_assets" | head -n 10 || true
+
+          rm -rf build/ios/unsigned
+          mkdir -p build/ios/unsigned/Payload
+          cp -R "$APP" build/ios/unsigned/Payload/
+
+          cd build/ios/unsigned
+          /usr/bin/zip -qry variphone_unsigned.ipa Payload
+
+    artifacts:
+      - build/ios/unsigned/*.ipa
+      - build/ios/iphoneos/*.app
+
+    publishing:
+      email:
+        recipients:
+          - ahmed.289ahmed@gmail.com
