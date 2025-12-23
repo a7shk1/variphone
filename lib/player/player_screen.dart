@@ -20,12 +20,14 @@ class PlayerScreen extends StatefulWidget {
 class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver {
   VideoPlayerController? _ctrl;
 
+  // UI state
   String _status = 'Opening Player...';
   bool _showUi = true;
   bool _fitCover = true;
   bool _isRestarting = false;
   double _volume = 1.0;
 
+  // retry
   int _epoch = 0;
   int _retryCount = 0;
   Timer? _retryTimer;
@@ -36,6 +38,11 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
   String? _url;
   Map<String, String> _headers = const {};
 
+  // UA rotation
+  late final List<String> _uaList;
+  int _uaIndex = 0;
+
+  // on-screen logs
   final List<String> _logs = [];
   void _log(String s) {
     dev.log(s, name: 'VarPlayer');
@@ -82,7 +89,6 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
     _epoch++;
     _retryTimer?.cancel();
     _ctrl?.dispose();
-
     WidgetsBinding.instance.removeObserver(this);
 
     () async {
@@ -104,39 +110,70 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
     }
   }
 
+  // ---------- Core open ----------
   Future<void> _openFromRaw(String raw) async {
     _log('Incoming rawLink length=${raw.length}');
     final parsed = StreamResolver.parseIncoming(raw);
     final url = parsed.url;
+
     if (url == null) {
       setState(() => _status = 'Bad link');
       _log('Bad link (parseIncoming returned null)');
       return;
     }
 
+    // منع أنواع ما تشتغل على AVPlayer
+    final low = url.toLowerCase();
+    if (low.contains('.mpd')) {
+      setState(() => _status = 'DASH (.mpd) not supported on iOS AVPlayer');
+      _log('Unsupported: MPD/DASH -> needs different player (not AVPlayer).');
+      return;
+    }
+    if (low.contains('/udp/') || low.startsWith('udp:') || low.contains('udp/239.')) {
+      setState(() => _status = 'UDP streams not supported on iOS');
+      _log('Unsupported: UDP multicast on iOS.');
+      return;
+    }
+
     _url = url;
     _headers = parsed.headers;
+
+    // UA rotation list:
+    // - إذا الرابط/البارس جايب UA، نستعمله فقط.
+    // - غير هيج نستخدم fallback list.
+    final forcedUa = StreamResolver.pickHeaderAnyCase(_headers, 'user-agent');
+    _uaList = (forcedUa != null && forcedUa.trim().isNotEmpty)
+        ? <String>[forcedUa]
+        : StreamResolver.uaFallbackList(preferHls: Platform.isIOS);
+
+    _uaIndex = 0;
     _retryCount = 0;
     _retryDelay = const Duration(seconds: 3);
 
     _log('Parsed URL: $url');
     _log('Headers count: ${_headers.length}');
+    _log('UA candidates: ${_uaList.length}');
+
     await _openResolved(url, _headers);
   }
 
   Future<void> _openResolved(String url, Map<String, String> headers) async {
     final myEpoch = ++_epoch;
     _retryTimer?.cancel();
-
     setState(() {
       _status = 'Resolving...';
       _isRestarting = true;
     });
 
     try {
+      // نثبت UA الحالي بالهيدر
+      final h = Map<String, String>.from(headers);
+      h['User-Agent'] = _uaList[_uaIndex];
+      _log('Using UA #${_uaIndex + 1}: ${h['User-Agent']}');
+
       final res = await StreamResolver.resolve(
         url,
-        headers: headers,
+        headers: h,
         preferHls: Platform.isIOS,
       );
       if (!mounted || myEpoch != _epoch) return;
@@ -144,10 +181,11 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
       _url = res.url;
       _headers = res.headers;
 
-      _log('Resolved URL: ${res.url}');
-      _log('Resolved headers: ${res.headers.length}');
+      // نضمن UA اللي اشتغل بالresolve يبقى ثابت
+      _headers['User-Agent'] = _uaList[_uaIndex];
 
-      await _openController(res.url, res.headers, myEpoch);
+      _log('Resolved URL: ${res.url}');
+      await _openController(res.url, _headers, myEpoch);
     } catch (e) {
       _log('resolve failed: $e');
       _scheduleRetry(url, myEpoch, headers, forceResolve: true);
@@ -161,7 +199,6 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
       _status = 'Initializing player...';
       _isRestarting = true;
     });
-
     _log('Creating VideoPlayerController...');
 
     final ctrl = VideoPlayerController.networkUrl(
@@ -183,7 +220,17 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
         if (!mounted || myEpoch != _epoch) return;
 
         if (v.hasError) {
-          _log('Player error: ${v.errorDescription}');
+          final err = (v.errorDescription ?? '');
+          _log('Player error: $err');
+
+          // ✅ أهم شي: جرّب UA ثاني قبل ما ندخل loop retries
+          if (_uaIndex + 1 < _uaList.length) {
+            _uaIndex++;
+            _log('Switching UA -> try #${_uaIndex + 1}');
+            _reopenSameUrlWithNewUa();
+            return;
+          }
+
           _scheduleRetry(url, myEpoch, headers);
         }
       });
@@ -196,15 +243,48 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
         _isRestarting = false;
         _retryCount = 0;
       });
-
       _log('Playing OK ✅');
       _kickAutoHide();
     } catch (e) {
       _log('initialize/play failed: $e');
+
+      // ✅ حتى initialize نفسه إذا فشل جرّب UA ثاني
+      if (_uaIndex + 1 < _uaList.length) {
+        _uaIndex++;
+        _log('Switching UA -> try #${_uaIndex + 1}');
+        _reopenSameUrlWithNewUa();
+        return;
+      }
+
       if (mounted && myEpoch == _epoch) _scheduleRetry(url, myEpoch, headers);
     }
   }
 
+  Future<void> _reopenSameUrlWithNewUa() async {
+    final u = _url;
+    if (u == null) return;
+
+    // نبدّل UA فقط ونفتح نفس الرابط (بدون resolve مرة ثانية)
+    final myEpoch = ++_epoch;
+    _retryTimer?.cancel();
+
+    final h = Map<String, String>.from(_headers);
+    h['User-Agent'] = _uaList[_uaIndex];
+    _headers = h;
+
+    setState(() {
+      _status = 'Retrying with different UA...';
+      _isRestarting = true;
+    });
+
+    // dispose القديم بسرعة
+    try { await _ctrl?.dispose(); } catch (_) {}
+    _ctrl = null;
+
+    await _openController(u, _headers, myEpoch);
+  }
+
+  // ---------- Retry ----------
   Duration _withJitter(Duration base) {
     final ms = base.inMilliseconds;
     final j = (ms * 0.2).toInt();
@@ -229,6 +309,10 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
     _retryTimer?.cancel();
     _retryTimer = Timer(_retryDelay, () async {
       if (!mounted || myEpoch != _epoch) return;
+
+      // بعد كل retry نرجع نجرب UA من البداية
+      _uaIndex = 0;
+
       if (forceResolve) {
         await _openResolved(url, headers);
       } else {
@@ -237,6 +321,7 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
     });
   }
 
+  // ---------- UI helpers ----------
   void _kickAutoHide() {
     Future.delayed(const Duration(seconds: 3), () {
       if (mounted) setState(() => _showUi = false);
@@ -312,7 +397,7 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
             if (initialized && (buffering || _isRestarting))
               const Positioned.fill(child: IgnorePointer(child: Center(child: CircularProgressIndicator()))),
 
-            // ✅ زر رجوع واضح
+            // زر رجوع واضح (مهم للآيباد)
             SafeArea(
               child: Align(
                 alignment: Alignment.topLeft,
