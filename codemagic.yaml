@@ -1,6 +1,6 @@
 workflows:
   ios-release:
-    name: iOS Unsigned IPA - variphone (fixed)
+    name: iOS Unsigned IPA (archive->payload) - variphone
     max_build_duration: 60
     instance_type: mac_mini_m2
 
@@ -24,27 +24,21 @@ workflows:
             exit 1
           fi
 
-          # 1) Ensure platform :ios, '13.0' exists (or update it if present)
           ruby -e "
             path='ios/Podfile'
             s=File.read(path)
-
             if s =~ /^platform :ios,/
               s = s.sub(/^platform :ios, *'[^']*'/, \"platform :ios, '13.0'\")
             else
               s = \"platform :ios, '13.0'\\n\" + s
             end
-
             File.write(path, s)
           "
 
-          # 2) Ensure post_install forces deployment target for Pods
-          #    (prevents pods staying at 12.0 while Runner is 13.0)
           ruby -e "
             path='ios/Podfile'
             s=File.read(path)
-
-            post_install_block = <<~RUBY
+            block = <<~RUBY
 
             post_install do |installer|
               installer.pods_project.targets.each do |target|
@@ -54,52 +48,71 @@ workflows:
               end
             end
             RUBY
-
             unless s.include?('post_install do |installer|')
-              s = s + post_install_block
+              s = s + block
               File.write(path, s)
             end
           "
 
-          echo "=== Podfile platform line ==="
-          grep -n \"^platform :ios\" ios/Podfile || true
-          echo "=== Podfile post_install exists? ==="
-          grep -n \"post_install do \\|installer\\|\" ios/Podfile || true
+          echo '=== Podfile platform ==='
+          grep -n "^platform :ios" ios/Podfile || true
 
       - name: CocoaPods install
         script: |
           set -euo pipefail
           cd ios
-
-          # Fresh pods setup on CI
-          pod repo update
           pod install --repo-update
-
           cd ..
 
-      - name: Build unsigned IPA (no codesign)
+      - name: Archive with Xcode (NO code signing)
         script: |
           set -euo pipefail
 
           flutter --version
-          flutter build ipa --release --no-codesign
 
-          echo "=== LIST build/ios ==="
-          ls -la build/ios || true
+          # تأكد workspace موجود (pod install يسويه)
+          ls -la ios || true
+          ls -la ios/Runner.xcworkspace || true
 
-          echo "=== LIST build/ios/ipa ==="
-          ls -la build/ios/ipa || true
+          # Archive بدون أي Signing (هذا يتجاوز طلب Development Team)
+          xcodebuild \
+            -workspace ios/Runner.xcworkspace \
+            -scheme Runner \
+            -configuration Release \
+            -sdk iphoneos \
+            -archivePath build/ios/archive/Runner.xcarchive \
+            archive \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            PROVISIONING_PROFILE=""
 
-          echo "=== LIST build/ios/archive ==="
+          echo "=== Archive contents ==="
           ls -la build/ios/archive || true
 
-          echo "=== FIND IPA ==="
-          find build/ios -maxdepth 5 -type f -name "*.ipa" -print || true
+      - name: Package unsigned IPA from xcarchive (Payload)
+        script: |
+          set -euo pipefail
+
+          APP="build/ios/archive/Runner.xcarchive/Products/Applications/Runner.app"
+          echo "Checking Runner.app in archive..."
+          ls -la "$APP"
+
+          rm -rf build/ios/unsigned
+          mkdir -p build/ios/unsigned/Payload
+          cp -R "$APP" build/ios/unsigned/Payload/
+
+          cd build/ios/unsigned
+          /usr/bin/zip -qry variphone_unsigned.ipa Payload
+
+          echo "=== IPA created ==="
+          ls -la variphone_unsigned.ipa
 
     artifacts:
-      - build/ios/ipa/*.ipa
+      - build/ios/unsigned/*.ipa
       - build/ios/archive/*.xcarchive
-      - build/ios/ipa/*.dSYM.zip
 
     publishing:
       email:
