@@ -3,7 +3,7 @@ import 'package:flutter/material.dart';
 /// لوحة ألوان داكنة أنيقة مع لمسة بنفسجي كهربائي
 class AppTheme {
   static const _seed = Color(0xFF8A2BE2); // بنفسجي مميز
-  static const _bg   = Color(0xFF0E0E12); // خلفية أسود داكن
+  static const _bg = Color(0xFF0E0E12); // خلفية أسود داكن
   static const _card = Color(0xFF17171C); // بطاقات
   static const _line = Color(0x22FFFFFF); // فاصل خفيف
 
@@ -11,7 +11,7 @@ class AppTheme {
     seedColor: _seed,
     brightness: Brightness.dark,
     primary: _seed,
-    surface: _card,       // أسطح البطاقات
+    surface: _card, // أسطح البطاقات
     background: _bg,
     onBackground: Colors.white,
     onSurface: Colors.white,
@@ -71,8 +71,8 @@ class AppTheme {
         ),
       ),
 
-      // ✅ هنا الإصلاح: CardTheme بدل CardThemeData
-      cardTheme: CardTheme(
+      // ✅ الإصلاح: لازم CardThemeData مو CardTheme
+      cardTheme: CardThemeData(
         color: _card,
         elevation: 10,
         shadowColor: Colors.black54,
