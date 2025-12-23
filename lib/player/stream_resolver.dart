@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io' show Platform;
 import 'package:http/http.dart' as http;
 
 class ResolvedStream {
@@ -8,87 +9,110 @@ class ResolvedStream {
 }
 
 class StreamResolver {
+  // -------- Public entry --------
   static Future<ResolvedStream> resolve(
     String rawUrl, {
     Map<String, String>? headers,
     bool preferHls = false,
   }) async {
-    final baseUri = Uri.parse(rawUrl);
-    final h = _merge(_defaultHeaders(baseUri), headers ?? {});
+    final uri = Uri.parse(rawUrl);
+    final h = _merge(_defaultHeaders(uri), headers ?? {});
 
-    // 0) iOS: جرّب HLS candidates أولاً
+    // 0) إذا نفضّل HLS (iOS): جرّب m3u8 candidates أولاً وتأكد فعلاً #EXTM3U
     if (preferHls) {
       final candidates = _hlsCandidates(rawUrl);
       for (final c in candidates) {
-        final ok = await _tryM3u8(Uri.parse(c), h);
+        final ok = await _tryGetM3u8(Uri.parse(c), h);
         if (ok != null) return ResolvedStream(ok.requestUrl, ok.headers);
       }
     }
 
     // 1) Try HEAD
-    final head = await _safeHead(baseUri, h);
+    final head = await _safeHead(uri, h);
     if (head != null) {
-      if (_looksLikeStream(head.requestUrl, head.contentType)) {
-        // إذا تفضّل HLS وحصلنا TS/unknown، جرّب candidates بناء على URL النهائي
+      final finalUrl = head.requestUrl;
+      final finalHeaders = head.headers;
+
+      // إذا الرابط واضح stream
+      if (_looksLikeStream(finalUrl, head.contentType)) {
+        // إذا iOS ويفضل HLS جرّب على URL النهائي
         if (preferHls) {
-          final candidates = _hlsCandidates(head.requestUrl);
+          final candidates = _hlsCandidates(finalUrl);
           for (final c in candidates) {
-            final ok = await _tryM3u8(Uri.parse(c), head.headers);
+            final ok = await _tryGetM3u8(Uri.parse(c), finalHeaders);
             if (ok != null) return ResolvedStream(ok.requestUrl, ok.headers);
           }
         }
-        return ResolvedStream(head.requestUrl, head.headers);
+        return ResolvedStream(finalUrl, finalHeaders);
       }
     }
 
     // 2) GET
-    final get = await _get(baseUri, h);
-    if (_looksLikeStream(get.requestUrl, get.contentType)) {
+    final get = await _get(uri, h);
+    final finalUrl2 = get.requestUrl;
+    final headers2 = get.headers;
+
+    // إذا GET رجع playlist فعلي (#EXTM3U) رجّعه كـ m3u8
+    if (_bodyLooksLikeM3u8(get.body) || finalUrl2.toLowerCase().contains('.m3u8')) {
+      // تأكيد m3u8 (إذا هو مو #EXTM3U فعلي، نحاول نستخرج)
+      final ok = await _tryGetM3u8(Uri.parse(finalUrl2), headers2);
+      if (ok != null) return ResolvedStream(ok.requestUrl, ok.headers);
+    }
+
+    if (_looksLikeStream(finalUrl2, get.contentType)) {
       if (preferHls) {
-        final candidates = _hlsCandidates(get.requestUrl);
+        final candidates = _hlsCandidates(finalUrl2);
         for (final c in candidates) {
-          final ok = await _tryM3u8(Uri.parse(c), get.headers);
+          final ok = await _tryGetM3u8(Uri.parse(c), headers2);
           if (ok != null) return ResolvedStream(ok.requestUrl, ok.headers);
         }
       }
-      return ResolvedStream(get.requestUrl, get.headers);
+      return ResolvedStream(finalUrl2, headers2);
     }
 
     // 3) Extract m3u8 from HTML/text
-    final extracted = _extractM3u8(get.body, get.requestUrl);
+    final extracted = _extractM3u8(get.body, finalUrl2);
     if (extracted != null) {
-      final ok = await _tryM3u8(Uri.parse(extracted), get.headers);
+      final ok = await _tryGetM3u8(Uri.parse(extracted), headers2);
       if (ok != null) return ResolvedStream(ok.requestUrl, ok.headers);
-      return ResolvedStream(extracted, get.headers);
+      return ResolvedStream(extracted, headers2);
     }
 
-    return ResolvedStream(get.requestUrl, get.headers);
+    // إذا وصلنا هنا: السيرفر مو دا يرجّع ستريم أصلاً
+    // نخليها ترجع نفس الـ URL بس غالباً AVPlayer رح يفشل
+    return ResolvedStream(finalUrl2, headers2);
   }
 
-  // -------- Link parsing (نفس اللي عندك) --------
+  // -------- Link parsing (supports your formats) --------
   static ({String? url, Map<String, String> headers}) parseIncoming(String raw) {
     Map<String, String> hdr = {};
     String? out;
 
+    // varplayer://play?t=...
     if (raw.startsWith('varplayer://')) {
       final uri = Uri.tryParse(raw);
       if (uri != null && uri.host == 'play') {
         hdr = _merge(_defaultHeaders(null), _headersFromQuery(uri.queryParametersAll));
+
         final t = uri.queryParameters['t'];
         if (t != null && t.isNotEmpty) {
           final dec = _decodeB64Url(t) ?? (t.startsWith('http') ? t : null);
-          if (dec != null) out = _extractUrlFromPayload(dec) ?? dec;
+          if (dec != null) {
+            out = _extractUrlFromPayload(dec) ?? dec;
+          }
         }
       }
       return (url: (out != null && out.startsWith('http')) ? out : null, headers: hdr);
     }
 
+    // direct http
     if (raw.startsWith('http')) {
       final uri = Uri.tryParse(raw);
       hdr = _merge(_defaultHeaders(uri), _headersFromQuery(uri?.queryParametersAll ?? const {}));
       return (url: raw, headers: hdr);
     }
 
+    // payload json
     out = _extractUrlFromPayload(raw);
     hdr = _defaultHeaders(Uri.tryParse(out ?? ''));
     return (url: (out != null && out.startsWith('http')) ? out : null, headers: hdr);
@@ -96,12 +120,16 @@ class StreamResolver {
 
   // ---------------- internals ----------------
 
+  static bool _bodyLooksLikeM3u8(String body) {
+    final t = body.trimLeft();
+    return t.startsWith('#EXTM3U');
+  }
+
   static List<String> _hlsCandidates(String url) {
+    final out = <String>{};
     final u = url;
     final lower = u.toLowerCase();
-    final out = <String>{};
 
-    // لو أصلاً m3u8
     if (lower.contains('.m3u8')) {
       out.add(u);
       return out.toList();
@@ -115,16 +143,15 @@ class StreamResolver {
     // بدون امتداد مثل /XtreamCodes/494
     final uri = Uri.tryParse(u);
     if (uri != null) {
-      final path = uri.path;
-      final hasDot = path.split('/').last.contains('.');
+      final last = uri.pathSegments.isEmpty ? '' : uri.pathSegments.last;
+      final hasDot = last.contains('.');
       if (!hasDot) {
-        out.add(uri.replace(path: '$path.m3u8').toString());
-        out.add(uri.replace(path: '$path/index.m3u8').toString());
+        out.add(uri.replace(path: '${uri.path}.m3u8').toString());
+        out.add(uri.replace(path: '${uri.path}/index.m3u8').toString());
 
-        // بعض البورتالات تسوي type=m3u8
-        final q = Map<String, dynamic>.from(uri.queryParameters);
+        final q = Map<String, String>.from(uri.queryParameters);
         q['type'] = 'm3u8';
-        out.add(uri.replace(queryParameters: q.map((k, v) => MapEntry(k, '$v'))).toString());
+        out.add(uri.replace(queryParameters: q).toString());
       }
     }
 
@@ -136,25 +163,21 @@ class StreamResolver {
     return i >= 0 ? url.substring(i) : '';
   }
 
-  static Future<_Resp?> _tryM3u8(Uri uri, Map<String, String> headers) async {
-    // GET صغير حتى نتأكد body فعلاً playlist
+  // ✅ أهم جزء: نتأكد فعلاً الرد m3u8 مو HTML/رسالة token
+  static Future<_Resp?> _tryGetM3u8(Uri uri, Map<String, String> headers) async {
     try {
       final c = http.Client();
       final r = await c.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       final merged = _mergeCookies(headers, r.headers);
       final finalUrl = (r.request?.url ?? uri).toString();
-      final ct = (r.headers['content-type'] ?? '').toLowerCase();
+      final ct = (r.headers['content-type'] ?? '');
       final body = r.body;
       c.close();
 
-      final looksM3u8 =
-          finalUrl.toLowerCase().contains('.m3u8') ||
-          ct.contains('application/vnd.apple.mpegurl') ||
-          ct.contains('application/x-mpegurl') ||
-          body.trimLeft().startsWith('#EXTM3U');
-
-      if (r.statusCode >= 200 && r.statusCode < 400 && looksM3u8) {
-        return _Resp(finalUrl, merged, r.headers['content-type'] ?? '', body);
+      if (r.statusCode >= 200 && r.statusCode < 400) {
+        if (_bodyLooksLikeM3u8(body)) {
+          return _Resp(finalUrl, merged, ct, body);
+        }
       }
     } catch (_) {}
     return null;
@@ -240,19 +263,29 @@ class StreamResolver {
     return null;
   }
 
+  // ✅ UA iOS Safari حتى ما ترفضه بوابات IPTV
   static Map<String, String> _defaultHeaders(Uri? uri) {
     final ref = uri != null && uri.host.isNotEmpty ? '${uri.scheme}://${uri.host}/' : null;
+
+    final iosUA =
+        'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1';
+
+    final winUA =
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36';
+
+    final ua = Platform.isIOS ? iosUA : winUA;
+
     return {
-      'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
-      'Accept': '*/*',
+      'User-Agent': ua,
+      'Accept':
+          'application/vnd.apple.mpegurl, application/x-mpegurl, video/mp2t, video/*;q=0.9, */*;q=0.8',
       'Accept-Language': 'en-US,en;q=0.9,ar;q=0.8',
-      // هذا يفيد بعض السيرفرات تطلع content-length بشكل أوضح
       'Accept-Encoding': 'identity',
+      'Cache-Control': 'no-cache',
+      'Pragma': 'no-cache',
       'Connection': 'keep-alive',
       if (ref != null) 'Referer': ref,
       if (ref != null && ref.startsWith('https')) 'Origin': ref.substring(0, ref.length - 1),
-      'Icy-MetaData': '1',
     };
   }
 
