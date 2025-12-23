@@ -6,14 +6,11 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:video_player/video_player.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
-import 'package:flutter_vlc_player/flutter_vlc_player.dart';
 
 import 'stream_resolver.dart';
 
-enum _Backend { videoPlayer, vlc }
-
 class PlayerScreen extends StatefulWidget {
-  final String rawLink;
+  final String rawLink; // يدعم http أو varplayer:// أو payload
   const PlayerScreen({super.key, required this.rawLink});
 
   @override
@@ -21,16 +18,16 @@ class PlayerScreen extends StatefulWidget {
 }
 
 class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver {
-  VideoPlayerController? _vp;
-  VlcPlayerController? _vlc;
-  _Backend? _backend;
+  VideoPlayerController? _ctrl;
 
+  // UI state
   String _status = 'Opening Player...';
   bool _showUi = true;
   bool _fitCover = true;
   bool _isRestarting = false;
   double _volume = 1.0;
 
+  // retry
   int _epoch = 0;
   int _retryCount = 0;
   Timer? _retryTimer;
@@ -41,6 +38,7 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
   String? _url;
   Map<String, String> _headers = const {};
 
+  // on-screen logs
   final List<String> _logs = [];
   void _log(String s) {
     dev.log(s, name: 'VarPlayer');
@@ -86,16 +84,19 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
   void dispose() {
     _epoch++;
     _retryTimer?.cancel();
-
-    _vp?.dispose();
-    _vlc?.dispose();
-
+    _ctrl?.dispose();
     WidgetsBinding.instance.removeObserver(this);
 
     () async {
-      try { await WakelockPlus.disable(); } catch (_) {}
-      try { await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge); } catch (_) {}
-      try { await SystemChrome.setPreferredOrientations(DeviceOrientation.values); } catch (_) {}
+      try {
+        await WakelockPlus.disable();
+      } catch (_) {}
+      try {
+        await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+      } catch (_) {}
+      try {
+        await SystemChrome.setPreferredOrientations(DeviceOrientation.values);
+      } catch (_) {}
     }();
 
     super.dispose();
@@ -104,14 +105,22 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
   @override
   void didChangeAppLifecycleState(AppLifecycleState s) {
     if (s == AppLifecycleState.paused) {
-      _vp?.pause();
-      _vlc?.pause();
-      () async { try { await WakelockPlus.disable(); } catch (_) {} }();
+      _ctrl?.pause();
+      () async {
+        try {
+          await WakelockPlus.disable();
+        } catch (_) {}
+      }();
     } else if (s == AppLifecycleState.resumed) {
-      () async { try { await WakelockPlus.enable(); } catch (_) {} }();
+      () async {
+        try {
+          await WakelockPlus.enable();
+        } catch (_) {}
+      }();
     }
   }
 
+  // ---------- Core open ----------
   Future<void> _openFromRaw(String raw) async {
     _log('Incoming rawLink length=${raw.length}');
     final parsed = StreamResolver.parseIncoming(raw);
@@ -130,69 +139,57 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
     _log('Parsed URL: $url');
     _log('Headers count: ${_headers.length}');
 
-    await _openResolved(url, _headers);
+    await _openResolved(url, _headers, preferHls: Platform.isIOS);
   }
 
-  Future<void> _openResolved(String url, Map<String, String> headers) async {
+  Future<void> _openResolved(
+    String url,
+    Map<String, String> headers, {
+    required bool preferHls,
+  }) async {
     final myEpoch = ++_epoch;
     _retryTimer?.cancel();
+
     setState(() {
       _status = 'Resolving...';
       _isRestarting = true;
     });
-    _log('Resolving...');
+    _log('Resolving... preferHls=$preferHls');
 
     try {
       final res = await StreamResolver.resolve(
         url,
         headers: headers,
-        preferHls: Platform.isIOS,
+        preferHls: preferHls,
       );
-
       if (!mounted || myEpoch != _epoch) return;
 
       _log('Resolved URL: ${res.url}');
       _url = res.url;
       _headers = res.headers;
 
-      await _openBackend(res.url, res.headers, myEpoch);
+      await _openController(res.url, res.headers, myEpoch);
     } catch (e) {
       _log('resolve failed: $e');
       _scheduleRetry(url, myEpoch, headers, forceResolve: true);
     }
   }
 
-  _Backend _pickBackend(String url) {
-    if (Platform.isIOS) return _Backend.vlc;
-    return _Backend.videoPlayer;
-  }
-
-  Future<void> _openBackend(String url, Map<String, String> headers, int myEpoch) async {
-    final backend = _pickBackend(url);
-    _backend = backend;
-
-    if (backend == _Backend.vlc) {
-      await _openVlc(url, headers, myEpoch);
-    } else {
-      await _openVideoPlayer(url, headers, myEpoch);
-    }
-  }
-
-  Future<void> _openVideoPlayer(String url, Map<String, String> headers, int myEpoch) async {
-    final old = _vp;
+  Future<void> _openController(String url, Map<String, String> headers, int myEpoch) async {
+    final old = _ctrl;
 
     setState(() {
       _status = 'Initializing player...';
       _isRestarting = true;
     });
-    _log('Using backend: video_player');
+    _log('Creating VideoPlayerController...');
 
     final ctrl = VideoPlayerController.networkUrl(
       Uri.parse(url),
       httpHeaders: headers,
       videoPlayerOptions: VideoPlayerOptions(mixWithOthers: true),
     );
-    _vp = ctrl;
+    _ctrl = ctrl;
 
     try {
       await ctrl.initialize();
@@ -203,120 +200,61 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
 
       ctrl.addListener(() {
         final v = ctrl.value;
-        if (v.hasError && mounted && myEpoch == _epoch) {
-          _log('VP error: ${v.errorDescription}');
+        if (!mounted || myEpoch != _epoch) return;
+
+        if (v.hasError) {
+          final err = (v.errorDescription ?? '').toLowerCase();
+          _log('Player error: ${v.errorDescription}');
+
+          // ✅ iOS AVPlayer: إذا خطأ byte-range/content-length نحاول نعيد Resolve مع تفضيل HLS
+          final looksLikeRangeIssue =
+              err.contains('coremediaerrordomain') ||
+              err.contains('-12939') ||
+              err.contains('byte range') ||
+              err.contains('content length');
+
+          if (Platform.isIOS && looksLikeRangeIssue) {
+            _log('iOS range/content-length issue detected -> retry with HLS preference');
+            _openResolved(_url ?? url, _headers, preferHls: true);
+            return;
+          }
+
           _scheduleRetry(url, myEpoch, headers);
         }
       });
 
       await ctrl.play();
-      try { await old?.dispose(); } catch (_) {}
+      try {
+        await old?.dispose();
+      } catch (_) {}
 
       setState(() {
         _status = 'Playing';
         _isRestarting = false;
         _retryCount = 0;
       });
-      _log('Playing OK ✅ (video_player)');
+      _log('Playing OK ✅');
       _kickAutoHide();
     } catch (e) {
-      _log('VP initialize/play failed: $e');
-
-      if (Platform.isIOS && mounted && myEpoch == _epoch) {
-        _log('Switching to VLC fallback on iOS...');
-        await _openVlc(url, headers, myEpoch);
-        return;
-      }
-
+      _log('initialize/play failed: $e');
       if (mounted && myEpoch == _epoch) _scheduleRetry(url, myEpoch, headers);
     }
   }
 
-  Future<void> _openVlc(String url, Map<String, String> headers, int myEpoch) async {
-    final old = _vlc;
-
-    setState(() {
-      _status = 'Initializing VLC...';
-      _isRestarting = true;
-    });
-    _log('Using backend: VLC');
-
-    try { await old?.stop(); } catch (_) {}
-    try { await old?.dispose(); } catch (_) {}
-
-    final ua = headers['User-Agent'];
-    final ref = headers['Referer'] ?? headers['Referrer'];
-
-    final httpArgs = <String>[
-      if (ua != null && ua.isNotEmpty) VlcHttpOptions.httpUserAgent(ua),
-      if (ref != null && ref.isNotEmpty) VlcHttpOptions.httpReferrer(ref),
-      VlcHttpOptions.httpReconnect(true),
-      VlcHttpOptions.httpForwardCookies(true),
-    ];
-
-    final opts = VlcPlayerOptions(
-      http: httpArgs.isEmpty ? null : VlcHttpOptions(httpArgs),
-      // extras: [':network-caching=1500'], // إذا تحب تزيد البفر
-    );
-
-    final ctrl = VlcPlayerController.network(
-      url,
-      // على iOS إذا تشوف black screen جرّب disabled (مهم)
-      hwAcc: Platform.isIOS ? HwAcc.disabled : HwAcc.auto,
-      autoPlay: true,
-      options: opts,
-    );
-
-    _vlc = ctrl;
-
-    // ✅ مهم: initialize حسب الدوكمنتشن
-    try {
-      await ctrl.initialize();
-    } catch (e) {
-      _log('VLC initialize failed: $e');
-      _scheduleRetry(url, myEpoch, headers);
-      return;
-    }
-
-    try { await ctrl.setVolume((_volume * 100).round()); } catch (_) {}
-
-    ctrl.addListener(() {
-      final v = ctrl.value;
-      if (!mounted || myEpoch != _epoch) return;
-
-      if (v.hasError) {
-        _log('VLC error: ${v.errorDescription}');
-        _scheduleRetry(url, myEpoch, headers);
-      }
-    });
-
-    // انتظر لحد ما يصير playing فعلاً
-    final start = DateTime.now();
-    while (mounted && myEpoch == _epoch && DateTime.now().difference(start).inSeconds < 6) {
-      if (_vlc?.value.isPlaying == true) break;
-      await Future.delayed(const Duration(milliseconds: 150));
-    }
-
-    if (!mounted || myEpoch != _epoch) return;
-
-    setState(() {
-      _status = (_vlc?.value.isPlaying == true) ? 'Playing' : 'Buffering...';
-      _isRestarting = false;
-      _retryCount = 0;
-    });
-
-    _log('VLC state isPlaying=${_vlc?.value.isPlaying}');
-    _kickAutoHide();
-  }
-
+  // ---------- Retry ----------
   Duration _withJitter(Duration base) {
     final ms = base.inMilliseconds;
-    final j = (ms * 0.2).toInt().clamp(1, 1 << 30);
+    final j = (ms * 0.2).toInt();
     final out = ms + ((DateTime.now().microsecond % (j * 2)) - j);
     return Duration(milliseconds: out.clamp(500, _retryDelayMax.inMilliseconds));
   }
 
-  void _scheduleRetry(String url, int myEpoch, Map<String, String> headers, {bool forceResolve = false}) {
+  void _scheduleRetry(
+    String url,
+    int myEpoch,
+    Map<String, String> headers, {
+    bool forceResolve = false,
+  }) {
     if (!mounted || myEpoch != _epoch) return;
 
     setState(() {
@@ -335,92 +273,62 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
       if (!mounted || myEpoch != _epoch) return;
 
       if (forceResolve) {
-        await _openResolved(url, headers);
+        await _openResolved(url, headers, preferHls: Platform.isIOS);
       } else {
-        final u = _url ?? url;
-        final h = _headers;
-        await _openBackend(u, h, myEpoch);
+        await _openController(_url ?? url, _headers, myEpoch);
       }
     });
   }
 
+  // ---------- UI helpers ----------
   void _kickAutoHide() {
     Future.delayed(const Duration(seconds: 3), () {
       if (mounted) setState(() => _showUi = false);
     });
   }
 
-  Future<void> _togglePlay() async {
-    if (_backend == _Backend.vlc) {
-      final c = _vlc;
-      if (c == null) return;
-      if (c.value.isPlaying == true) {
-        await c.pause();
-      } else {
-        await c.play();
-      }
-      setState(() {});
-      _kickAutoHide();
-      return;
-    }
+  bool get _isVod {
+    final v = _ctrl?.value;
+    final d = v?.duration;
+    final u = (_url ?? '').toLowerCase();
+    if (d != null && d > Duration.zero) return true;
+    if (u.contains('.mp4') || u.contains('.mpd')) return true;
+    return false;
+  }
 
-    final c = _vp;
+  Future<void> _jumpToLiveEdge() async {
+    final c = _ctrl;
     if (c == null) return;
-    if (c.value.isPlaying) {
-      await c.pause();
-    } else {
-      await c.play();
-    }
-    setState(() {});
+
+    final ranges = c.value.buffered;
+    if (ranges.isEmpty) return;
+
+    final end = ranges.last.end;
+    if (end <= Duration.zero) return;
+
+    await c.seekTo(end);
+    if (!c.value.isPlaying) await c.play();
+    setState(() => _isRestarting = false);
     _kickAutoHide();
-  }
-
-  Future<void> _applyVolume(double v) async {
-    _volume = v;
-    if (_backend == _Backend.vlc) {
-      try { await _vlc?.setVolume((v * 100).round()); } catch (_) {}
-    } else {
-      try { await _vp?.setVolume(v); } catch (_) {}
-    }
-    if (mounted) setState(() {});
-    _kickAutoHide();
-  }
-
-  bool get _initialized {
-    if (_backend == _Backend.vlc) return _vlc?.value.isInitialized == true;
-    return _vp?.value.isInitialized == true;
-  }
-
-  bool get _playing {
-    if (_backend == _Backend.vlc) return _vlc?.value.isPlaying == true;
-    return _vp?.value.isPlaying == true;
   }
 
   @override
   Widget build(BuildContext context) {
+    final v = _ctrl?.value;
+    final initialized = v?.isInitialized == true;
+    final playing = v?.isPlaying == true;
+    final buffering = v?.isBuffering == true;
+
+    final aspect = (v?.aspectRatio ?? 0) == 0 ? 16 / 9 : v!.aspectRatio;
+
+    final duration = v?.duration ?? Duration.zero;
+    final position = v?.position ?? Duration.zero;
+    final buffered = v?.buffered ?? const <DurationRange>[];
+
     Widget videoArea() {
-      if (_backend == _Backend.vlc) {
-        if (_vlc == null) return Text(_status, style: const TextStyle(color: Colors.white70));
-
-        final ar = (_vlc!.value.aspectRatio == 0) ? 16 / 9 : _vlc!.value.aspectRatio;
-
-        return VlcPlayer(
-          controller: _vlc!,
-          aspectRatio: ar,
-          placeholder: Center(
-            child: Text(_status, style: const TextStyle(color: Colors.white70)),
-          ),
-        );
-      }
-
-      final v = _vp?.value;
-      final initialized = v?.isInitialized == true;
-      if (!initialized || _vp == null) {
+      if (!initialized || _ctrl == null) {
         return Text(_status, style: const TextStyle(color: Colors.white70));
       }
-
-      final aspect = (v?.aspectRatio ?? 0) == 0 ? 16 / 9 : v!.aspectRatio;
-
       return FittedBox(
         fit: _fitCover ? BoxFit.cover : BoxFit.contain,
         child: SizedBox(
@@ -428,7 +336,7 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
           height: 720,
           child: AspectRatio(
             aspectRatio: aspect,
-            child: VideoPlayer(_vp!),
+            child: VideoPlayer(_ctrl!),
           ),
         ),
       );
@@ -439,16 +347,26 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
         setState(() => _showUi = !_showUi);
         if (_showUi) _kickAutoHide();
       },
+      onDoubleTapDown: (d) {
+        if (!_isVod || _ctrl == null) return;
+        final w = MediaQuery.of(context).size.width;
+        final back = d.localPosition.dx < w / 2;
+        final delta = const Duration(seconds: 10);
+        final newPos = back ? position - delta : position + delta;
+        _ctrl!.seekTo(newPos < Duration.zero ? Duration.zero : newPos);
+        setState(() => _showUi = true);
+        _kickAutoHide();
+      },
       child: Scaffold(
         backgroundColor: Colors.black,
         body: Stack(
           children: [
             Positioned.fill(child: Center(child: videoArea())),
 
-            if (_initialized && _isRestarting)
+            if (initialized && (buffering || _isRestarting))
               const Positioned.fill(child: IgnorePointer(child: Center(child: CircularProgressIndicator()))),
 
-            // ✅ زر رجوع واضح
+            // ✅ زر رجوع واضح (دائم)
             SafeArea(
               child: Align(
                 alignment: Alignment.topLeft,
@@ -467,7 +385,8 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
               ),
             ),
 
-            if (_initialized && _showUi)
+            // Controls overlay
+            if (initialized && _showUi)
               Positioned.fill(
                 child: Container(
                   color: Colors.black38,
@@ -482,13 +401,16 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
                             Container(
                               padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
                               decoration: BoxDecoration(color: Colors.black54, borderRadius: BorderRadius.circular(14)),
-                              child: Text(
-                                _backend == _Backend.vlc ? 'VLC' : 'VP',
-                                style: const TextStyle(color: Colors.white, fontSize: 12),
-                              ),
+                              child: Text(_isVod ? 'VOD' : 'LIVE',
+                                  style: const TextStyle(color: Colors.white, fontSize: 12)),
                             ),
                             Row(
                               children: [
+                                TextButton(
+                                  onPressed: _jumpToLiveEdge,
+                                  child: const Text('LIVE',
+                                      style: TextStyle(color: Colors.redAccent, fontWeight: FontWeight.bold)),
+                                ),
                                 IconButton(
                                   tooltip: _fitCover ? 'Contain' : 'Cover',
                                   onPressed: () {
@@ -499,7 +421,7 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
                                 ),
                                 IconButton(
                                   tooltip: 'Reload',
-                                  onPressed: _url == null ? null : () => _openResolved(_url!, _headers),
+                                  onPressed: _url == null ? null : () => _openResolved(_url!, _headers, preferHls: Platform.isIOS),
                                   icon: const Icon(Icons.refresh, color: Colors.white),
                                 ),
                                 const SizedBox(width: 8),
@@ -515,8 +437,17 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
                           IconButton(
                             iconSize: 64,
                             color: Colors.white,
-                            onPressed: _togglePlay,
-                            icon: Icon(_playing ? Icons.pause_circle : Icons.play_circle),
+                            onPressed: () async {
+                              if (_ctrl == null) return;
+                              if (playing) {
+                                await _ctrl!.pause();
+                              } else {
+                                await _ctrl!.play();
+                              }
+                              setState(() {});
+                              _kickAutoHide();
+                            },
+                            icon: Icon(playing ? Icons.pause_circle : Icons.play_circle),
                           ),
                         ],
                       ),
@@ -524,20 +455,43 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
                       SafeArea(
                         child: Padding(
                           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                          child: Row(
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
                             children: [
-                              Text(_status, style: const TextStyle(color: Colors.white70, fontSize: 12)),
-                              const Spacer(),
-                              const Icon(Icons.volume_up, size: 18, color: Colors.white70),
-                              SizedBox(
-                                width: 140,
-                                child: Slider(
-                                  min: 0,
-                                  max: 1,
-                                  value: _volume,
-                                  onChanged: (v) => setState(() => _volume = v),
-                                  onChangeEnd: (v) => _applyVolume(v),
-                                ),
+                              if (_isVod)
+                                _BufferedBar(
+                                  duration: duration,
+                                  position: position,
+                                  ranges: buffered,
+                                  onSeek: (to) => _ctrl?.seekTo(to),
+                                )
+                              else
+                                const LinearProgressIndicator(value: null, backgroundColor: Colors.white24, minHeight: 3),
+                              const SizedBox(height: 8),
+                              Row(
+                                children: [
+                                  Text(_isVod ? _fmt(position) : 'LIVE',
+                                      style: const TextStyle(color: Colors.white70, fontSize: 12)),
+                                  const Spacer(),
+                                  if (_isVod)
+                                    Text(_fmt(duration),
+                                        style: const TextStyle(color: Colors.white70, fontSize: 12)),
+                                  const SizedBox(width: 12),
+                                  const Icon(Icons.volume_up, size: 18, color: Colors.white70),
+                                  SizedBox(
+                                    width: 140,
+                                    child: Slider(
+                                      min: 0,
+                                      max: 1,
+                                      value: _volume,
+                                      onChanged: (v) => setState(() => _volume = v),
+                                      onChangeEnd: (v) async {
+                                        await _ctrl?.setVolume(v);
+                                        _kickAutoHide();
+                                      },
+                                    ),
+                                  ),
+                                ],
                               ),
                             ],
                           ),
@@ -576,6 +530,85 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
           ],
         ),
       ),
+    );
+  }
+
+  String _fmt(Duration d) {
+    String two(int n) => n.toString().padLeft(2, '0');
+    final h = d.inHours, m = d.inMinutes.remainder(60), s = d.inSeconds.remainder(60);
+    return h > 0 ? '$h:${two(m)}:${two(s)}' : '${two(m)}:${two(s)}';
+  }
+}
+
+class _BufferedBar extends StatelessWidget {
+  final Duration duration, position;
+  final List<DurationRange> ranges;
+  final ValueChanged<Duration> onSeek;
+
+  const _BufferedBar({
+    required this.duration,
+    required this.position,
+    required this.ranges,
+    required this.onSeek,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final totalMs = duration.inMilliseconds.clamp(1, 1 << 31);
+    final playedMs = position.inMilliseconds.clamp(0, totalMs);
+
+    return LayoutBuilder(
+      builder: (_, cons) {
+        final w = cons.maxWidth;
+        double msToPx(int ms) => (ms / totalMs) * w;
+
+        return GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTapDown: (d) {
+            final r = (d.localPosition.dx / w).clamp(0.0, 1.0);
+            onSeek(Duration(milliseconds: (totalMs * r).round()));
+          },
+          onHorizontalDragUpdate: (d) {
+            final r = (d.localPosition.dx / w).clamp(0.0, 1.0);
+            onSeek(Duration(milliseconds: (totalMs * r).round()));
+          },
+          child: SizedBox(
+            height: 24,
+            child: Stack(
+              alignment: Alignment.centerLeft,
+              children: [
+                Container(height: 3, color: Colors.white24),
+                ...ranges.map((r) {
+                  final left = msToPx(r.start.inMilliseconds);
+                  final right = msToPx(r.end.inMilliseconds);
+                  return Positioned(
+                    left: left.clamp(0.0, w),
+                    width: (right - left).clamp(0.0, w),
+                    top: 0,
+                    bottom: 0,
+                    child: Container(height: 3, color: Colors.white54),
+                  );
+                }),
+                Positioned(
+                  left: 0,
+                  width: msToPx(playedMs),
+                  top: 0,
+                  bottom: 0,
+                  child: Container(height: 3, color: Colors.white),
+                ),
+                Positioned(
+                  left: (msToPx(playedMs) - 6).clamp(0.0, w - 12),
+                  child: Container(
+                    width: 12,
+                    height: 12,
+                    decoration: const BoxDecoration(color: Colors.white, shape: BoxShape.circle),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
     );
   }
 }
