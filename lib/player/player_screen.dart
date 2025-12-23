@@ -10,7 +10,7 @@ import 'package:wakelock_plus/wakelock_plus.dart';
 import 'stream_resolver.dart';
 
 class PlayerScreen extends StatefulWidget {
-  final String rawLink; // يدعم http أو varplayer:// أو payload
+  final String rawLink;
   const PlayerScreen({super.key, required this.rawLink});
 
   @override
@@ -20,14 +20,12 @@ class PlayerScreen extends StatefulWidget {
 class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver {
   VideoPlayerController? _ctrl;
 
-  // UI state
   String _status = 'Opening Player...';
   bool _showUi = true;
   bool _fitCover = true;
   bool _isRestarting = false;
   double _volume = 1.0;
 
-  // retry
   int _epoch = 0;
   int _retryCount = 0;
   Timer? _retryTimer;
@@ -38,7 +36,6 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
   String? _url;
   Map<String, String> _headers = const {};
 
-  // on-screen logs
   final List<String> _logs = [];
   void _log(String s) {
     dev.log(s, name: 'VarPlayer');
@@ -85,18 +82,13 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
     _epoch++;
     _retryTimer?.cancel();
     _ctrl?.dispose();
+
     WidgetsBinding.instance.removeObserver(this);
 
     () async {
-      try {
-        await WakelockPlus.disable();
-      } catch (_) {}
-      try {
-        await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
-      } catch (_) {}
-      try {
-        await SystemChrome.setPreferredOrientations(DeviceOrientation.values);
-      } catch (_) {}
+      try { await WakelockPlus.disable(); } catch (_) {}
+      try { await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge); } catch (_) {}
+      try { await SystemChrome.setPreferredOrientations(DeviceOrientation.values); } catch (_) {}
     }();
 
     super.dispose();
@@ -106,21 +98,12 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
   void didChangeAppLifecycleState(AppLifecycleState s) {
     if (s == AppLifecycleState.paused) {
       _ctrl?.pause();
-      () async {
-        try {
-          await WakelockPlus.disable();
-        } catch (_) {}
-      }();
+      () async { try { await WakelockPlus.disable(); } catch (_) {} }();
     } else if (s == AppLifecycleState.resumed) {
-      () async {
-        try {
-          await WakelockPlus.enable();
-        } catch (_) {}
-      }();
+      () async { try { await WakelockPlus.enable(); } catch (_) {} }();
     }
   }
 
-  // ---------- Core open ----------
   Future<void> _openFromRaw(String raw) async {
     _log('Incoming rawLink length=${raw.length}');
     final parsed = StreamResolver.parseIncoming(raw);
@@ -138,15 +121,10 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
 
     _log('Parsed URL: $url');
     _log('Headers count: ${_headers.length}');
-
-    await _openResolved(url, _headers, preferHls: Platform.isIOS);
+    await _openResolved(url, _headers);
   }
 
-  Future<void> _openResolved(
-    String url,
-    Map<String, String> headers, {
-    required bool preferHls,
-  }) async {
+  Future<void> _openResolved(String url, Map<String, String> headers) async {
     final myEpoch = ++_epoch;
     _retryTimer?.cancel();
 
@@ -154,19 +132,20 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
       _status = 'Resolving...';
       _isRestarting = true;
     });
-    _log('Resolving... preferHls=$preferHls');
 
     try {
       final res = await StreamResolver.resolve(
         url,
         headers: headers,
-        preferHls: preferHls,
+        preferHls: Platform.isIOS,
       );
       if (!mounted || myEpoch != _epoch) return;
 
-      _log('Resolved URL: ${res.url}');
       _url = res.url;
       _headers = res.headers;
+
+      _log('Resolved URL: ${res.url}');
+      _log('Resolved headers: ${res.headers.length}');
 
       await _openController(res.url, res.headers, myEpoch);
     } catch (e) {
@@ -182,6 +161,7 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
       _status = 'Initializing player...';
       _isRestarting = true;
     });
+
     _log('Creating VideoPlayerController...');
 
     final ctrl = VideoPlayerController.networkUrl(
@@ -203,36 +183,20 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
         if (!mounted || myEpoch != _epoch) return;
 
         if (v.hasError) {
-          final err = (v.errorDescription ?? '').toLowerCase();
           _log('Player error: ${v.errorDescription}');
-
-          // ✅ iOS AVPlayer: إذا خطأ byte-range/content-length نحاول نعيد Resolve مع تفضيل HLS
-          final looksLikeRangeIssue =
-              err.contains('coremediaerrordomain') ||
-              err.contains('-12939') ||
-              err.contains('byte range') ||
-              err.contains('content length');
-
-          if (Platform.isIOS && looksLikeRangeIssue) {
-            _log('iOS range/content-length issue detected -> retry with HLS preference');
-            _openResolved(_url ?? url, _headers, preferHls: true);
-            return;
-          }
-
           _scheduleRetry(url, myEpoch, headers);
         }
       });
 
       await ctrl.play();
-      try {
-        await old?.dispose();
-      } catch (_) {}
+      try { await old?.dispose(); } catch (_) {}
 
       setState(() {
         _status = 'Playing';
         _isRestarting = false;
         _retryCount = 0;
       });
+
       _log('Playing OK ✅');
       _kickAutoHide();
     } catch (e) {
@@ -241,7 +205,6 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
     }
   }
 
-  // ---------- Retry ----------
   Duration _withJitter(Duration base) {
     final ms = base.inMilliseconds;
     final j = (ms * 0.2).toInt();
@@ -249,12 +212,7 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
     return Duration(milliseconds: out.clamp(500, _retryDelayMax.inMilliseconds));
   }
 
-  void _scheduleRetry(
-    String url,
-    int myEpoch,
-    Map<String, String> headers, {
-    bool forceResolve = false,
-  }) {
+  void _scheduleRetry(String url, int myEpoch, Map<String, String> headers, {bool forceResolve = false}) {
     if (!mounted || myEpoch != _epoch) return;
 
     setState(() {
@@ -271,16 +229,14 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
     _retryTimer?.cancel();
     _retryTimer = Timer(_retryDelay, () async {
       if (!mounted || myEpoch != _epoch) return;
-
       if (forceResolve) {
-        await _openResolved(url, headers, preferHls: Platform.isIOS);
+        await _openResolved(url, headers);
       } else {
         await _openController(_url ?? url, _headers, myEpoch);
       }
     });
   }
 
-  // ---------- UI helpers ----------
   void _kickAutoHide() {
     Future.delayed(const Duration(seconds: 3), () {
       if (mounted) setState(() => _showUi = false);
@@ -347,16 +303,6 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
         setState(() => _showUi = !_showUi);
         if (_showUi) _kickAutoHide();
       },
-      onDoubleTapDown: (d) {
-        if (!_isVod || _ctrl == null) return;
-        final w = MediaQuery.of(context).size.width;
-        final back = d.localPosition.dx < w / 2;
-        final delta = const Duration(seconds: 10);
-        final newPos = back ? position - delta : position + delta;
-        _ctrl!.seekTo(newPos < Duration.zero ? Duration.zero : newPos);
-        setState(() => _showUi = true);
-        _kickAutoHide();
-      },
       child: Scaffold(
         backgroundColor: Colors.black,
         body: Stack(
@@ -366,7 +312,7 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
             if (initialized && (buffering || _isRestarting))
               const Positioned.fill(child: IgnorePointer(child: Center(child: CircularProgressIndicator()))),
 
-            // ✅ زر رجوع واضح (دائم)
+            // ✅ زر رجوع واضح
             SafeArea(
               child: Align(
                 alignment: Alignment.topLeft,
@@ -385,7 +331,6 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
               ),
             ),
 
-            // Controls overlay
             if (initialized && _showUi)
               Positioned.fill(
                 child: Container(
@@ -421,7 +366,7 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
                                 ),
                                 IconButton(
                                   tooltip: 'Reload',
-                                  onPressed: _url == null ? null : () => _openResolved(_url!, _headers, preferHls: Platform.isIOS),
+                                  onPressed: _url == null ? null : () => _openResolved(_url!, _headers),
                                   icon: const Icon(Icons.refresh, color: Colors.white),
                                 ),
                                 const SizedBox(width: 8),
