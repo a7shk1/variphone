@@ -9,81 +9,101 @@ class ResolvedStream {
 }
 
 class StreamResolver {
-  // -------- Public entry --------
+  // =========================
+  // Public entry
+  // =========================
   static Future<ResolvedStream> resolve(
     String rawUrl, {
     Map<String, String>? headers,
     bool preferHls = false,
   }) async {
     final uri = Uri.parse(rawUrl);
-    final h = _merge(_defaultHeaders(uri), headers ?? {});
 
-    // 0) إذا نفضّل HLS (iOS): جرّب m3u8 candidates أولاً وتأكد فعلاً #EXTM3U
-    if (preferHls) {
-      final candidates = _hlsCandidates(rawUrl);
-      for (final c in candidates) {
-        final ok = await _tryGetM3u8(Uri.parse(c), h);
-        if (ok != null) return ResolvedStream(ok.requestUrl, ok.headers);
-      }
-    }
+    // 1) نبني headers الأساسية + ندمج headers القادمة من PlayerScreen/parseIncoming
+    final baseHeaders = _merge(_defaultHeaders(uri), headers ?? {});
+    final uaFromCaller = _pickHeaderAnyCase(baseHeaders, 'user-agent');
 
-    // 1) Try HEAD
-    final head = await _safeHead(uri, h);
-    if (head != null) {
-      final finalUrl = head.requestUrl;
-      final finalHeaders = head.headers;
+    // 2) إذا caller محدد UA، ما نغيره
+    final uaList = uaFromCaller != null && uaFromCaller.trim().isNotEmpty
+        ? <String>[uaFromCaller]
+        : _uaFallbackList(preferHls: preferHls);
 
-      // إذا الرابط واضح stream
-      if (_looksLikeStream(finalUrl, head.contentType)) {
-        // إذا iOS ويفضل HLS جرّب على URL النهائي
+    // 3) حاول بترتيب الـ UA (مهم لبوابات IPTV)
+    Object? lastError;
+    for (final ua in uaList) {
+      final h = Map<String, String>.from(baseHeaders);
+      h['User-Agent'] = ua;
+
+      try {
+        // iOS يفضل HLS: جرّب candidates للم3u8 أولاً
         if (preferHls) {
-          final candidates = _hlsCandidates(finalUrl);
+          final candidates = _hlsCandidates(rawUrl);
           for (final c in candidates) {
-            final ok = await _tryGetM3u8(Uri.parse(c), finalHeaders);
+            final ok = await _tryGetM3u8(Uri.parse(c), h);
             if (ok != null) return ResolvedStream(ok.requestUrl, ok.headers);
           }
         }
-        return ResolvedStream(finalUrl, finalHeaders);
-      }
-    }
 
-    // 2) GET
-    final get = await _get(uri, h);
-    final finalUrl2 = get.requestUrl;
-    final headers2 = get.headers;
+        // HEAD
+        final head = await _safeHead(uri, h);
+        if (head != null) {
+          if (_looksLikeStream(head.requestUrl, head.contentType)) {
+            if (preferHls) {
+              final candidates = _hlsCandidates(head.requestUrl);
+              for (final c in candidates) {
+                final ok = await _tryGetM3u8(Uri.parse(c), head.headers);
+                if (ok != null) return ResolvedStream(ok.requestUrl, ok.headers);
+              }
+            }
+            return ResolvedStream(head.requestUrl, head.headers);
+          }
+        }
 
-    // إذا GET رجع playlist فعلي (#EXTM3U) رجّعه كـ m3u8
-    if (_bodyLooksLikeM3u8(get.body) || finalUrl2.toLowerCase().contains('.m3u8')) {
-      // تأكيد m3u8 (إذا هو مو #EXTM3U فعلي، نحاول نستخرج)
-      final ok = await _tryGetM3u8(Uri.parse(finalUrl2), headers2);
-      if (ok != null) return ResolvedStream(ok.requestUrl, ok.headers);
-    }
+        // GET
+        final get = await _get(uri, h);
 
-    if (_looksLikeStream(finalUrl2, get.contentType)) {
-      if (preferHls) {
-        final candidates = _hlsCandidates(finalUrl2);
-        for (final c in candidates) {
-          final ok = await _tryGetM3u8(Uri.parse(c), headers2);
+        // إذا GET جاب m3u8 فعلاً
+        if (_bodyLooksLikeM3u8(get.body) || get.requestUrl.toLowerCase().contains('.m3u8')) {
+          final ok = await _tryGetM3u8(Uri.parse(get.requestUrl), get.headers);
           if (ok != null) return ResolvedStream(ok.requestUrl, ok.headers);
         }
+
+        // إذا GET رجع ستريم مباشر (ts/mp4/...)
+        if (_looksLikeStream(get.requestUrl, get.contentType)) {
+          // على iOS جرّب HLS من finalUrl
+          if (preferHls) {
+            final candidates = _hlsCandidates(get.requestUrl);
+            for (final c in candidates) {
+              final ok = await _tryGetM3u8(Uri.parse(c), get.headers);
+              if (ok != null) return ResolvedStream(ok.requestUrl, ok.headers);
+            }
+          }
+          return ResolvedStream(get.requestUrl, get.headers);
+        }
+
+        // استخراج m3u8 من HTML
+        final extracted = _extractM3u8(get.body, get.requestUrl);
+        if (extracted != null) {
+          final ok = await _tryGetM3u8(Uri.parse(extracted), get.headers);
+          if (ok != null) return ResolvedStream(ok.requestUrl, ok.headers);
+          return ResolvedStream(extracted, get.headers);
+        }
+
+        // ما لكينا شي: جرّع requestUrl (قد يفشل لاحقًا بس خلّيه)
+        return ResolvedStream(get.requestUrl, get.headers);
+      } catch (e) {
+        lastError = e;
+        // نكمل UA اللي بعده
       }
-      return ResolvedStream(finalUrl2, headers2);
     }
 
-    // 3) Extract m3u8 from HTML/text
-    final extracted = _extractM3u8(get.body, finalUrl2);
-    if (extracted != null) {
-      final ok = await _tryGetM3u8(Uri.parse(extracted), headers2);
-      if (ok != null) return ResolvedStream(ok.requestUrl, ok.headers);
-      return ResolvedStream(extracted, headers2);
-    }
-
-    // إذا وصلنا هنا: السيرفر مو دا يرجّع ستريم أصلاً
-    // نخليها ترجع نفس الـ URL بس غالباً AVPlayer رح يفشل
-    return ResolvedStream(finalUrl2, headers2);
+    // إذا كل المحاولات فشلت
+    throw Exception('StreamResolver failed for all UA attempts. Last error: $lastError');
   }
 
-  // -------- Link parsing (supports your formats) --------
+  // =========================
+  // Link parsing (supports your formats)
+  // =========================
   static ({String? url, Map<String, String> headers}) parseIncoming(String raw) {
     Map<String, String> hdr = {};
     String? out;
@@ -118,37 +138,60 @@ class StreamResolver {
     return (url: (out != null && out.startsWith('http')) ? out : null, headers: hdr);
   }
 
-  // ---------------- internals ----------------
+  // =========================
+  // Internals
+  // =========================
 
-  static bool _bodyLooksLikeM3u8(String body) {
-    final t = body.trimLeft();
-    return t.startsWith('#EXTM3U');
+  static bool _bodyLooksLikeM3u8(String body) => body.trimLeft().startsWith('#EXTM3U');
+
+  // UA list: iOS Safari -> VLC -> PotPlayer -> Chrome
+  static List<String> _uaFallbackList({required bool preferHls}) {
+    const iosSafari =
+        'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1';
+    const vlcWin =
+        'VLC/3.0.20 LibVLC/3.0.20';
+    const potPlayer =
+        'PotPlayer/1.7.21996 (Windows NT 10.0; Win64; x64)';
+    const chromeWin =
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36';
+
+    // على iOS خلّي iOS UA أولاً، على غيره خلّي VLC/Chrome أولاً
+    if (Platform.isIOS || preferHls) {
+      return [iosSafari, vlcWin, potPlayer, chromeWin];
+    }
+    return [vlcWin, potPlayer, chromeWin, iosSafari];
   }
 
+  // candidates قوية لـ Xtream/TS/M3U8
   static List<String> _hlsCandidates(String url) {
     final out = <String>{};
     final u = url;
     final lower = u.toLowerCase();
 
+    // إذا أصلاً m3u8
     if (lower.contains('.m3u8')) {
       out.add(u);
       return out.toList();
     }
 
-    // ts -> m3u8
+    // ts -> m3u8 (يحافظ على query)
     if (RegExp(r'\.ts(\?.*)?$', caseSensitive: false).hasMatch(u)) {
       out.add(u.replaceFirst(RegExp(r'\.ts(\?.*)?$', caseSensitive: false), '.m3u8${_qs(u)}'));
+      out.add(u.replaceFirst(RegExp(r'\.ts(\?.*)?$', caseSensitive: false), '/index.m3u8${_qs(u)}'));
     }
 
-    // بدون امتداد مثل /XtreamCodes/494
     final uri = Uri.tryParse(u);
     if (uri != null) {
+      final path = uri.path;
       final last = uri.pathSegments.isEmpty ? '' : uri.pathSegments.last;
       final hasDot = last.contains('.');
-      if (!hasDot) {
-        out.add(uri.replace(path: '${uri.path}.m3u8').toString());
-        out.add(uri.replace(path: '${uri.path}/index.m3u8').toString());
 
+      // Xtream style: آخر جزء رقم/ID بدون امتداد
+      if (!hasDot) {
+        out.add(uri.replace(path: '$path.m3u8').toString());
+        out.add(uri.replace(path: '$path/index.m3u8').toString());
+
+        // بعض السيرفرات تستخدم ?type=m3u8
         final q = Map<String, String>.from(uri.queryParameters);
         q['type'] = 'm3u8';
         out.add(uri.replace(queryParameters: q).toString());
@@ -163,7 +206,7 @@ class StreamResolver {
     return i >= 0 ? url.substring(i) : '';
   }
 
-  // ✅ أهم جزء: نتأكد فعلاً الرد m3u8 مو HTML/رسالة token
+  // ✅ تأكيد playlist حقيقي (#EXTM3U) مو HTML/JSON/token
   static Future<_Resp?> _tryGetM3u8(Uri uri, Map<String, String> headers) async {
     try {
       final c = http.Client();
@@ -174,10 +217,8 @@ class StreamResolver {
       final body = r.body;
       c.close();
 
-      if (r.statusCode >= 200 && r.statusCode < 400) {
-        if (_bodyLooksLikeM3u8(body)) {
-          return _Resp(finalUrl, merged, ct, body);
-        }
+      if (r.statusCode >= 200 && r.statusCode < 400 && _bodyLooksLikeM3u8(body)) {
+        return _Resp(finalUrl, merged, ct, body);
       }
     } catch (_) {}
     return null;
@@ -263,20 +304,10 @@ class StreamResolver {
     return null;
   }
 
-  // ✅ UA iOS Safari حتى ما ترفضه بوابات IPTV
+  // Default headers (بدون تثبيت UA نهائيًا هنا، لأنه يتبدّل بالـ resolve)
   static Map<String, String> _defaultHeaders(Uri? uri) {
     final ref = uri != null && uri.host.isNotEmpty ? '${uri.scheme}://${uri.host}/' : null;
-
-    final iosUA =
-        'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1';
-
-    final winUA =
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36';
-
-    final ua = Platform.isIOS ? iosUA : winUA;
-
     return {
-      'User-Agent': ua,
       'Accept':
           'application/vnd.apple.mpegurl, application/x-mpegurl, video/mp2t, video/*;q=0.9, */*;q=0.8',
       'Accept-Language': 'en-US,en;q=0.9,ar;q=0.8',
@@ -308,6 +339,13 @@ class StreamResolver {
       }
     }
     return out;
+  }
+
+  static String? _pickHeaderAnyCase(Map<String, String> h, String keyLower) {
+    for (final e in h.entries) {
+      if (e.key.toLowerCase() == keyLower) return e.value;
+    }
+    return null;
   }
 
   static Map<String, String> _merge(Map<String, String> base, Map<String, String> over) {
