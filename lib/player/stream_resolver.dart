@@ -8,100 +8,87 @@ class ResolvedStream {
 }
 
 class StreamResolver {
-  // -------- Public entry --------
   static Future<ResolvedStream> resolve(
-      String rawUrl, {
-        Map<String, String>? headers,
-        bool preferHls = false,
-      }) async {
-    final uri = Uri.parse(rawUrl);
-    final h = _merge(_defaultHeaders(uri), headers ?? {});
+    String rawUrl, {
+    Map<String, String>? headers,
+    bool preferHls = false,
+  }) async {
+    final baseUri = Uri.parse(rawUrl);
+    final h = _merge(_defaultHeaders(baseUri), headers ?? {});
 
-    // 0) Prefer HLS على iOS: جرّب تحويل ts -> m3u8 أولاً إذا ممكن
+    // 0) iOS: جرّب HLS candidates أولاً
     if (preferHls) {
-      final hls = _tryMakeHlsFromTs(rawUrl);
-      if (hls != null) {
-        final ok = await _probeStream(Uri.parse(hls), h);
-        if (ok != null) {
-          return ResolvedStream(ok.requestUrl, ok.headers);
-        }
+      final candidates = _hlsCandidates(rawUrl);
+      for (final c in candidates) {
+        final ok = await _tryM3u8(Uri.parse(c), h);
+        if (ok != null) return ResolvedStream(ok.requestUrl, ok.headers);
       }
     }
 
-    // 1) Try HEAD (fast)
-    final head = await _safeHead(uri, h);
+    // 1) Try HEAD
+    final head = await _safeHead(baseUri, h);
     if (head != null) {
-      final finalUrl = head.requestUrl;
-      final finalHeaders = head.headers;
-      if (_looksLikeStream(finalUrl, head.contentType)) {
-        // إذا نفضّل HLS، جرّب بعد التحويل حتى لو الـ HEAD رجّع ts
+      if (_looksLikeStream(head.requestUrl, head.contentType)) {
+        // إذا تفضّل HLS وحصلنا TS/unknown، جرّب candidates بناء على URL النهائي
         if (preferHls) {
-          final hls2 = _tryMakeHlsFromTs(finalUrl);
-          if (hls2 != null) {
-            final ok = await _probeStream(Uri.parse(hls2), finalHeaders);
-            if (ok != null) {
-              return ResolvedStream(ok.requestUrl, ok.headers);
-            }
+          final candidates = _hlsCandidates(head.requestUrl);
+          for (final c in candidates) {
+            final ok = await _tryM3u8(Uri.parse(c), head.headers);
+            if (ok != null) return ResolvedStream(ok.requestUrl, ok.headers);
           }
         }
-        return ResolvedStream(finalUrl, finalHeaders);
+        return ResolvedStream(head.requestUrl, head.headers);
       }
     }
 
-    // 2) GET (page or stream)
-    final get = await _get(uri, h);
-    final finalUrl2 = get.requestUrl;
-    final headers2 = get.headers;
-
-    if (_looksLikeStream(finalUrl2, get.contentType)) {
+    // 2) GET
+    final get = await _get(baseUri, h);
+    if (_looksLikeStream(get.requestUrl, get.contentType)) {
       if (preferHls) {
-        final hls3 = _tryMakeHlsFromTs(finalUrl2);
-        if (hls3 != null) {
-          final ok = await _probeStream(Uri.parse(hls3), headers2);
-          if (ok != null) {
-            return ResolvedStream(ok.requestUrl, ok.headers);
-          }
+        final candidates = _hlsCandidates(get.requestUrl);
+        for (final c in candidates) {
+          final ok = await _tryM3u8(Uri.parse(c), get.headers);
+          if (ok != null) return ResolvedStream(ok.requestUrl, ok.headers);
         }
       }
-      return ResolvedStream(finalUrl2, headers2);
+      return ResolvedStream(get.requestUrl, get.headers);
     }
 
     // 3) Extract m3u8 from HTML/text
-    final extracted = _extractM3u8(get.body, finalUrl2);
-    return ResolvedStream(extracted ?? finalUrl2, headers2);
+    final extracted = _extractM3u8(get.body, get.requestUrl);
+    if (extracted != null) {
+      final ok = await _tryM3u8(Uri.parse(extracted), get.headers);
+      if (ok != null) return ResolvedStream(ok.requestUrl, ok.headers);
+      return ResolvedStream(extracted, get.headers);
+    }
+
+    return ResolvedStream(get.requestUrl, get.headers);
   }
 
-  // -------- Link parsing (supports your 4 formats) --------
+  // -------- Link parsing (نفس اللي عندك) --------
   static ({String? url, Map<String, String> headers}) parseIncoming(String raw) {
     Map<String, String> hdr = {};
     String? out;
 
-    // varplayer://play?t=...
     if (raw.startsWith('varplayer://')) {
       final uri = Uri.tryParse(raw);
       if (uri != null && uri.host == 'play') {
-        // headers from query
         hdr = _merge(_defaultHeaders(null), _headersFromQuery(uri.queryParametersAll));
-
         final t = uri.queryParameters['t'];
         if (t != null && t.isNotEmpty) {
           final dec = _decodeB64Url(t) ?? (t.startsWith('http') ? t : null);
-          if (dec != null) {
-            out = _extractUrlFromPayload(dec) ?? dec;
-          }
+          if (dec != null) out = _extractUrlFromPayload(dec) ?? dec;
         }
       }
       return (url: (out != null && out.startsWith('http')) ? out : null, headers: hdr);
     }
 
-    // direct http
     if (raw.startsWith('http')) {
       final uri = Uri.tryParse(raw);
       hdr = _merge(_defaultHeaders(uri), _headersFromQuery(uri?.queryParametersAll ?? const {}));
       return (url: raw, headers: hdr);
     }
 
-    // payload json
     out = _extractUrlFromPayload(raw);
     hdr = _defaultHeaders(Uri.tryParse(out ?? ''));
     return (url: (out != null && out.startsWith('http')) ? out : null, headers: hdr);
@@ -109,23 +96,65 @@ class StreamResolver {
 
   // ---------------- internals ----------------
 
-  // Probe بسيط: GET صغير (Range) حتى نتأكد الرابط صالح كستريم
-  static Future<_Resp?> _probeStream(Uri uri, Map<String, String> headers) async {
+  static List<String> _hlsCandidates(String url) {
+    final u = url;
+    final lower = u.toLowerCase();
+    final out = <String>{};
+
+    // لو أصلاً m3u8
+    if (lower.contains('.m3u8')) {
+      out.add(u);
+      return out.toList();
+    }
+
+    // ts -> m3u8
+    if (RegExp(r'\.ts(\?.*)?$', caseSensitive: false).hasMatch(u)) {
+      out.add(u.replaceFirst(RegExp(r'\.ts(\?.*)?$', caseSensitive: false), '.m3u8${_qs(u)}'));
+    }
+
+    // بدون امتداد مثل /XtreamCodes/494
+    final uri = Uri.tryParse(u);
+    if (uri != null) {
+      final path = uri.path;
+      final hasDot = path.split('/').last.contains('.');
+      if (!hasDot) {
+        out.add(uri.replace(path: '$path.m3u8').toString());
+        out.add(uri.replace(path: '$path/index.m3u8').toString());
+
+        // بعض البورتالات تسوي type=m3u8
+        final q = Map<String, dynamic>.from(uri.queryParameters);
+        q['type'] = 'm3u8';
+        out.add(uri.replace(queryParameters: q.map((k, v) => MapEntry(k, '$v'))).toString());
+      }
+    }
+
+    return out.toList();
+  }
+
+  static String _qs(String url) {
+    final i = url.indexOf('?');
+    return i >= 0 ? url.substring(i) : '';
+  }
+
+  static Future<_Resp?> _tryM3u8(Uri uri, Map<String, String> headers) async {
+    // GET صغير حتى نتأكد body فعلاً playlist
     try {
       final c = http.Client();
-      final h = Map<String, String>.from(headers);
-
-      // بعض السيرفرات تتصرف أحسن مع Range صغير
-      h['Range'] = 'bytes=0-1024';
-
-      final r = await c.get(uri, headers: h).timeout(const Duration(seconds: 8));
+      final r = await c.get(uri, headers: headers).timeout(const Duration(seconds: 10));
       final merged = _mergeCookies(headers, r.headers);
       final finalUrl = (r.request?.url ?? uri).toString();
-      final ct = r.headers['content-type'] ?? '';
+      final ct = (r.headers['content-type'] ?? '').toLowerCase();
+      final body = r.body;
       c.close();
 
-      if (r.statusCode >= 200 && r.statusCode < 400 && _looksLikeStream(finalUrl, ct)) {
-        return _Resp(finalUrl, merged, ct, '');
+      final looksM3u8 =
+          finalUrl.toLowerCase().contains('.m3u8') ||
+          ct.contains('application/vnd.apple.mpegurl') ||
+          ct.contains('application/x-mpegurl') ||
+          body.trimLeft().startsWith('#EXTM3U');
+
+      if (r.statusCode >= 200 && r.statusCode < 400 && looksM3u8) {
+        return _Resp(finalUrl, merged, r.headers['content-type'] ?? '', body);
       }
     } catch (_) {}
     return null;
@@ -156,34 +185,15 @@ class StreamResolver {
     return _Resp(finalUrl, merged, ct, body);
   }
 
-  static String? _tryMakeHlsFromTs(String url) {
-    final u = url.toLowerCase();
-
-    // إذا أصلاً m3u8 لا تغيّر
-    if (u.contains('.m3u8')) return null;
-
-    // ts -> m3u8 (مع الحفاظ على query)
-    final m = RegExp(r'\.ts(\?.*)?$').firstMatch(url);
-    if (m != null) {
-      final q = m.group(1) ?? '';
-      return url.replaceFirst(RegExp(r'\.ts(\?.*)?$'), '.m3u8$q');
-    }
-
-    return null;
-  }
-
   static bool _looksLikeStream(String url, String ct) {
     final u = url.toLowerCase();
     final c = ct.toLowerCase();
-
     if (u.contains('.m3u8') || u.contains('.mp4') || u.contains('.mpd') || u.contains('.ts')) return true;
-
     if (c.contains('application/vnd.apple.mpegurl') ||
         c.contains('application/x-mpegurl') ||
         c.contains('application/dash+xml') ||
         c.contains('video/') ||
         c.contains('application/octet-stream')) return true;
-
     return false;
   }
 
@@ -195,10 +205,8 @@ class StreamResolver {
         RegExp(r'''https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*''', caseSensitive: false),
         RegExp(r'''src\s*=\s*["']([^"']+\.m3u8[^"']*)["']''', caseSensitive: false),
         RegExp(r'''(data-file|data-src|href)\s*=\s*["']([^"']+\.m3u8[^"']*)["']''', caseSensitive: false),
-        RegExp(
-          r'''<meta[^>]+http-equiv=["']refresh["'][^>]+content=["'][^"']*url=([^"']+)["']''',
-          caseSensitive: false,
-        ),
+        RegExp(r'''<meta[^>]+http-equiv=["']refresh["'][^>]+content=["'][^"']*url=([^"']+)["']''',
+            caseSensitive: false),
         RegExp(r'''<source[^>]+src=["']([^"']+\.m3u8[^"']*)["'][^>]*>''', caseSensitive: false),
       ];
 
@@ -233,14 +241,13 @@ class StreamResolver {
   }
 
   static Map<String, String> _defaultHeaders(Uri? uri) {
-    final ref = (uri != null && uri.host.isNotEmpty) ? '${uri.scheme}://${uri.host}/' : null;
-
+    final ref = uri != null && uri.host.isNotEmpty ? '${uri.scheme}://${uri.host}/' : null;
     return {
       'User-Agent':
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
       'Accept': '*/*',
       'Accept-Language': 'en-US,en;q=0.9,ar;q=0.8',
-      // يساعد بعض السيرفرات تطلع Content-Length مضبوط
+      // هذا يفيد بعض السيرفرات تطلع content-length بشكل أوضح
       'Accept-Encoding': 'identity',
       'Connection': 'keep-alive',
       if (ref != null) 'Referer': ref,
@@ -256,7 +263,6 @@ class StreamResolver {
     final ua = first(all['ua']);
     final ref = first(all['referer']) ?? first(all['ref']);
     final org = first(all['origin']);
-
     if (ua?.isNotEmpty == true) out['User-Agent'] = ua!;
     if (ref?.isNotEmpty == true) out['Referer'] = ref!;
     if (org?.isNotEmpty == true) out['Origin'] = org!;
@@ -265,9 +271,7 @@ class StreamResolver {
     if (hs != null) {
       for (final item in hs) {
         final i = item.indexOf(':');
-        if (i > 0) {
-          out[item.substring(0, i).trim()] = item.substring(i + 1).trim();
-        }
+        if (i > 0) out[item.substring(0, i).trim()] = item.substring(i + 1).trim();
       }
     }
     return out;
@@ -285,7 +289,6 @@ class StreamResolver {
 
     respHeaders.forEach((k, v) {
       if (k.toLowerCase() == 'set-cookie' && v.isNotEmpty) {
-        // ملاحظة: هذا تبسيط، بس كافي لمعظم الحالات
         for (final part in v.split(',')) {
           final first = part.split(';').first.trim();
           if (first.contains('=')) all.add(first);
